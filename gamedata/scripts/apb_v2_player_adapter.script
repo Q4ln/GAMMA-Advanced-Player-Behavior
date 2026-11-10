@@ -1,0 +1,533 @@
+-- Advanced Player Behavior v2: narrow adapters for current GAMMA player APIs.
+-- Gameplay policy belongs to the subsystem modules, not here.
+--
+-- Frame memo: active_weapon(), active_slot(), moving_state()
+-- and presentation_blocked() are computed at most once per core frame epoch;
+-- the core advances the epoch on every engine update, hardware edge, synthetic
+-- action, mutation event and reset, so within one epoch every consumer sees
+-- one consistent world.  There is no manual drop and none is needed: the
+-- core's epoch counters only ever increase, so a stale stamp can never match
+-- again.  weapon_lowered() is never memoised (readiness
+-- re-reads it around game.actor_lower_weapon inside one epoch).  Caches that
+-- outlive a frame (ini lines, Free Zoom eligibility, installed-upgrade lists)
+-- are keyed on the core's mutation epoch or, for system.ltx, never expire.
+--
+-- Device adapters (NVG, BAS laser, Mark Switch) live in apb_v2_device_adapter.
+
+local api = apb_v2_core
+
+MC_CROUCH = 16
+MC_ACCEL = 32
+MC_CLIMB = 2048
+MC_SPRINT = 4096
+
+STANCE_STAND = 0
+STANCE_CROUCH = 1
+STANCE_PRONE = 2
+
+-- The core helpers every probe uses, bound once by init(); the composition
+-- root initialises this adapter before any module runs.
+local call, method, yes, epoch, mutation_epoch
+
+function init(core)
+	api = core or apb_v2_core
+	call = api.safe_call
+	method = api.safe_method
+	yes = api.truthy
+	epoch = api.epoch
+	mutation_epoch = api.mutation_epoch
+end
+
+
+local function has_bit(value, mask)
+	value = tonumber(value) or 0
+	return math.floor(value / mask) % 2 == 1
+end
+
+
+local moving_epoch = -1
+local moving_value = 0
+
+function moving_state()
+	-- actor_moving_state is a native engine query that can terminate the process
+	-- during on_game_start; Lua pcall cannot contain that C-side failure.  GAMMA
+	-- exposes db.actor only after movement state is safe to query, and core.actor
+	-- additionally rejects level teardown and other non-present contexts.
+	if not (db and db.actor) then return 0 end
+	if not api.actor(false) then return 0 end
+	local current = epoch()
+	if moving_epoch == current then return moving_value end
+	local value, ok = call(level and level.actor_moving_state)
+	moving_epoch = current
+	moving_value = ok and tonumber(value) or 0
+	return moving_value
+end
+
+
+function realized_stance()
+	local state = moving_state()
+	if has_bit(state, MC_CROUCH) then
+		return has_bit(state, MC_ACCEL) and STANCE_PRONE or STANCE_CROUCH
+	end
+	return STANCE_STAND
+end
+
+
+function sprinting()
+	return has_bit(moving_state(), MC_SPRINT)
+end
+
+
+function climbing()
+	if has_bit(moving_state(), MC_CLIMB) then return true end
+	local value, ok = call(GetEvent, "actor_climbing")
+	return ok and yes(value, false) or false
+end
+
+
+function actor(require_alive)
+	return api.actor(require_alive)
+end
+
+
+function object_id(object)
+	return api.actor_id(object)
+end
+
+
+function object_alive(object)
+	local value, ok = method(object, "alive")
+	return ok and yes(value, false) or false
+end
+
+
+function hud_free()
+	if not actor(true) then return false end
+	if yes(method(call(device), "is_paused"), false) then return false end
+	if actor_menu and actor_menu.is_hud_free then
+		local value, ok = call(actor_menu.is_hud_free)
+		if not (ok and value) then return false end
+	end
+	return true
+end
+
+
+local function lam2_running()
+	local value, ok = call(lam2 and lam2.is_running)
+	return ok and yes(value, false) or false
+end
+
+
+function mask_wipe_running()
+	local state = actor_effects and tonumber(actor_effects.mc_anm_state)
+	if state and state ~= 0 then return true end
+	local action, ok = call(lam2 and lam2.get_current_action)
+	if ok and type(action) == "table" then
+		local sec = tostring(action.sec or "")
+		local name = tostring(action.name or action.tag or "")
+		if sec == "anim_mask_clean" or string.find(name, "mask", 1, true) then return true end
+	end
+	return false
+end
+
+
+function mask_on()
+	local value, ok = call(actor_effects and actor_effects.is_mask_on)
+	return ok and yes(value, false) or false
+end
+
+
+function wetness()
+	local state, ok = call(alife_storage_manager and alife_storage_manager.get_state)
+	local drops = ok and type(state) == "table" and state.r2_drops_control or nil
+	local value = type(drops) == "table" and tonumber(drops[1]) or 0
+	return api.clamp(value, 0, 1)
+end
+
+
+function section(object)
+	local value, ok = method(object, "section")
+	return ok and value or nil
+end
+
+
+local function weapon_cast(object)
+	local value, ok = method(object, "cast_Weapon")
+	return ok and value or nil
+end
+
+
+-- system.ltx is immutable for the process lifetime, so every (kind, section,
+-- key) triple is read from ini_sys at most once: line_exist plus the typed
+-- reader on the first probe, a table lookup afterwards.  A found value is
+-- never nil (false is a legitimate cached bool); MISSING marks a line that
+-- does not exist.  The reader's fallback only matters when the line is
+-- missing, which the line_exist probe already settled, so it is not part of
+-- the key.
+local READER = { bool = "r_bool_ex", float = "r_float_ex", string = "r_string_ex" }
+local MISSING = {}
+local ini_cache = { bool = {}, float = {}, string = {} }
+
+local function ini_value(section_name, key, kind, fallback)
+	if not (section_name and ini_sys) then return nil, false end
+	local reader = READER[kind]
+	if not reader then return nil, false end
+	local by_section = ini_cache[kind]
+	local row = by_section[section_name]
+	if row == nil then
+		row = {}
+		by_section[section_name] = row
+	end
+	local hit = row[key]
+	if hit ~= nil then
+		if hit == MISSING then return nil, false end
+		return hit, true
+	end
+	local exists, checked = method(ini_sys, "line_exist", section_name, key)
+	if not checked or not exists then
+		row[key] = MISSING
+		return nil, false
+	end
+	local value, ok = method(ini_sys, reader, section_name, key, fallback)
+	if not (ok and value ~= nil) then
+		row[key] = MISSING
+		return nil, false
+	end
+	row[key] = value
+	return value, true
+end
+
+
+local function sight_section(item)
+	local value, ok = call(item and z_3d_scopes and z_3d_scopes.get_sight_section, item)
+	return ok and value or nil
+end
+
+
+-- Installed-upgrade sections and resolved sight section of the item under one
+-- freezoom_eligible evaluation: read once, shared by the evaluation's ~9
+-- probes.  Outside an evaluation (alt_aim_supported from contextual) every
+-- probe iterates and resolves for itself.
+local scoped_item = nil
+local scoped_upgrades = nil
+local scoped_sight = nil
+
+local function collect_upgrades(item)
+	local list = {}
+	method(item, "iterate_installed_upgrades", function(upgrade)
+		list[#list + 1] = upgrade
+	end)
+	return list
+end
+
+
+local function upgrade_value(item, key, kind)
+	if not item then return nil, false end
+	local selected, found = nil, false
+	if scoped_item == item then
+		local list = scoped_upgrades
+		for index = 1, #list do
+			local value, exists = ini_value(list[index], key, kind)
+			if exists then
+				selected = value
+				found = true
+			end
+		end
+		return selected, found
+	end
+	method(item, "iterate_installed_upgrades", function(upgrade)
+		local value, exists = ini_value(upgrade, key, kind)
+		if exists then
+			selected = value
+			found = true
+		end
+	end)
+	return selected, found
+end
+
+
+function effective_value(item, key, kind)
+	local value, found = upgrade_value(item, key, kind)
+	if found then return value, true, "upgrade" end
+	local item_section = section(item)
+	value, found = ini_value(item_section, key, kind)
+	if found then return value, true, "weapon" end
+	local sight
+	if scoped_item == item then sight = scoped_sight else sight = sight_section(item) end
+	if sight and sight ~= item_section then
+		value, found = ini_value(sight, key, kind)
+		if found then return value, true, "sight" end
+	end
+	return nil, false, nil
+end
+
+
+local slot_epoch = -1
+local slot_value = nil
+
+-- One engine read per frame epoch, shared with the snapshot build below.  The
+-- memo is what makes snapshot.slot and a bare active_slot() the same value
+-- inside one frame, which is what lets presentation_blocked serve both of its
+-- caller forms (with a snapshot, and with nil) from a single entry.
+function active_slot()
+	local current = epoch()
+	if slot_epoch ~= current then
+		local player = actor(true)
+		slot_epoch = current
+		slot_value = player and tonumber((method(player, "active_slot"))) or nil
+	end
+	return slot_value
+end
+
+
+local snapshot_epoch = -1
+local snapshot_value = nil
+
+-- One immutable snapshot per frame epoch; the table is read-only by contract.
+-- The build is inlined rather than delegated: this is the deepest call chain
+-- of an idle frame and the scheduler-budget allocation probe is sensitive to
+-- an extra frame on it.
+function active_weapon()
+	local current = epoch()
+	if snapshot_epoch == current then return snapshot_value end
+	snapshot_epoch = current
+	local player = actor(true)
+	if not player then
+		snapshot_value = { supported = false }
+		return snapshot_value
+	end
+	local item = method(player, "active_item")
+	-- The slot memo is read and written inline rather than through
+	-- active_slot(): one engine read per epoch either way, without adding a
+	-- call frame to the deepest chain of an idle frame.
+	local slot
+	if slot_epoch == current then
+		slot = slot_value
+	else
+		slot = tonumber((method(player, "active_slot")))
+		slot_epoch = current
+		slot_value = slot
+	end
+	local id = object_id(item)
+	local item_section = section(item)
+	local raw, ok = call(item and IsWeapon, item)
+	local is_weapon = ok and yes(raw, false) or false
+	local cast = is_weapon and weapon_cast(item) or nil
+	local state = is_weapon and tonumber((method(item, "get_state"))) or nil
+	local zoomed = cast and yes(method(cast, "IsZoomed"), false) or false
+	if axr_main and axr_main.weapon_is_zoomed ~= nil then
+		zoomed = yes(axr_main.weapon_is_zoomed, zoomed)
+	end
+	local zoom_type = zoomed and tonumber((method(cast, "GetZoomType"))) or nil
+	local lowerable = false
+	if is_weapon and item_section then
+		lowerable = yes((ini_value(item_section, "can_be_lowered", "bool", false)), false)
+	end
+	snapshot_value = {
+		item = item,
+		id = id,
+		section = item_section,
+		slot = slot,
+		state = state,
+		cast = cast,
+		zoomed = zoomed,
+		zoom_type = zoom_type,
+		is_weapon = is_weapon,
+		supported = is_weapon and slot ~= 14 and lowerable,
+	}
+	return snapshot_value
+end
+
+
+function weapon_lowered()
+	-- Like actor_moving_state, this native accessor is not safe before the actor
+	-- exists (or after teardown), even when invoked through Lua pcall.
+	if not actor(true) then return nil end
+	local value, ok = call(game and game.actor_weapon_lowered)
+	if not ok then return nil end
+	return yes(value, false)
+end
+
+
+function sync_lws(lowered)
+	if type(lower_weapon_sprint) ~= "table" or lower_weapon_sprint.manually_lowered == nil then return false end
+	lower_weapon_sprint.manually_lowered = lowered and true or false
+	return true
+end
+
+
+local function evaluate_blocked(slot, allow_sprint)
+	local player = actor(true)
+	if not player then return true, "actor", true end
+	if method(player, "get_attached_vehicle") ~= nil then return true, "vehicle", true end
+	local cutscene, ok = call(level and level.check_cam_effector, 210408)
+	if ok and cutscene and cutscene ~= 0 then return true, "cutscene", true end
+	if climbing() then return true, "climb", false end
+	if not allow_sprint and sprinting() then return true, "sprint", false end
+	if not hud_free() then return true, "hud", false end
+	local motion_allowed, motion_ok = call(game and game.hud_motion_allowed)
+	if motion_ok and not yes(motion_allowed, true) then return true, "hud-animation", false end
+	local move_only, move_ok = call(game and game.only_movekeys_allowed)
+	if move_ok and yes(move_only, false) then return true, "input-lock", false end
+	if liz_fdda_input_manager and yes(liz_fdda_input_manager.is_input_disabled, false) then
+		return true, "fdda-input", false
+	end
+	if lam2_running() then return true, "lam2", false end
+	if type(check_anim) == "table" and yes(check_anim.anim_playing, false) then return true, "check-animation", false end
+	if type(arti_jamming) == "table" and yes(arti_jamming.anim_playing, false) then return true, "jam-animation", false end
+	if slot == false then slot = active_slot() end
+	if slot == 14 then return true, "quick-melee", false end
+	return false, nil, false
+end
+
+
+-- Verdicts memoised per frame epoch, keyed on allow_sprint and the slot the
+-- caller's snapshot carries (false = resolve the active slot here).
+-- Parallel tables plus an epoch stamp: no allocation once a key is warm.
+--
+-- Callers that want the sprint-allowed verdict (stance, visor) all pass nil so
+-- they share one key and one evaluation on a frame where both are awake; the
+-- slot memo above guarantees the resolved slot equals the slot any snapshot
+-- built in the same epoch carries, so the two forms cannot disagree.
+local blocked_epoch = {}
+local blocked_flag = {}
+local blocked_reason = {}
+local blocked_destructive = {}
+
+function presentation_blocked(snapshot, allow_sprint)
+	local slot = snapshot and snapshot.slot or false
+	local key = (slot == false and -1 or slot) * 2 + (allow_sprint and 1 or 0)
+	local current = epoch()
+	if blocked_epoch[key] ~= current then
+		local blocked, reason, destructive = evaluate_blocked(slot, allow_sprint)
+		blocked_epoch[key] = current
+		blocked_flag[key] = blocked
+		blocked_reason[key] = reason
+		blocked_destructive[key] = destructive
+	end
+	return blocked_flag[key], blocked_reason[key], blocked_destructive[key]
+end
+
+
+function alt_aim_supported(snapshot)
+	if not (snapshot and snapshot.item) then return false end
+	local value, found = effective_value(snapshot.item, "use_alt_aim_hud", "bool")
+	return found and yes(value, false) or false
+end
+
+
+local function native_dynamic_zoom(snapshot)
+	if not (snapshot and snapshot.item) then return false end
+	local key = snapshot.zoom_type == 1 and "scope_dynamic_zoom_alt" or
+		(snapshot.zoom_type == 2 and "scope_dynamic_zoom_gl" or "scope_dynamic_zoom")
+	local value, found = effective_value(snapshot.item, key, "bool")
+	return found and yes(value, false) or false
+end
+
+
+local function nonempty(value)
+	if value == nil then return false end
+	value = tostring(value)
+	return value ~= "" and value ~= "nil" and value ~= "0"
+end
+
+
+local OPTICAL_KEYS = {
+	"scope_texture", "scope_lense_fov", "scope_fov", "shader_scope",
+	"s3ds_reticle_size", "s3ds_eye_relief", "s3ds_exit_pupil",
+}
+
+local function optical_metadata(item, suffix)
+	for index = 1, #OPTICAL_KEYS do
+		local value, found = effective_value(item, OPTICAL_KEYS[index] .. suffix, "string")
+		if found and nonempty(value) then return true end
+	end
+	return false
+end
+
+
+-- The stock predicates are resolved on every call, never captured.
+local function excluded_item(item)
+	local value, ok = call(IsGrenade, item)
+	if ok and yes(value, false) then return true end
+	value, ok = call(IsBolt, item)
+	return ok and yes(value, false) or false
+end
+
+
+local function evaluate_eligibility(snapshot)
+	if snapshot.slot == 14 or not snapshot.is_weapon then return false, "non-weapon" end
+	if excluded_item(snapshot.item) then return false, "excluded-item" end
+	local class = tostring(ini_value(snapshot.section, "class", "string", "") or "")
+	if class == "WP_BINOC" then return false, "binocular" end
+	local dynamic = native_dynamic_zoom(snapshot)
+	if dynamic then return false, "dynamic-zoom" end
+	if snapshot.zoom_type == 0 then
+		local attached, known = method(snapshot.cast, "IsScopeAttached")
+		if not known then return false, "scope-state-unknown" end
+		if yes(attached, false) then return false, "attached-optic" end
+		local integrated, integrated_known = method(snapshot.item, "weapon_is_scope")
+		if integrated_known and yes(integrated, false) then return false, "integrated-optic" end
+		local status, status_found = effective_value(snapshot.item, "scope_status", "float")
+		if status_found and tonumber(status) == 1 then return false, "permanent-optic" end
+		if optical_metadata(snapshot.item, "") then return false, "optical-metadata" end
+		return true, "primary-iron"
+	end
+	if snapshot.zoom_type ~= 1 then return false, "launcher-or-other" end
+	if not alt_aim_supported(snapshot) then return false, "alt-unsupported" end
+	local factor, factor_found = effective_value(snapshot.item, "scope_zoom_factor_alt", "float")
+	if not factor_found or tonumber(factor) ~= 0 then return false, "alt-factor-ambiguous" end
+	if optical_metadata(snapshot.item, "_alt") then return false, "alt-optical-metadata" end
+	return true, "alt-non-optical"
+end
+
+
+-- Verdict cache per weapon id: reused while section, resolved sight
+-- section and zoom type match; the whole table is dropped when the core's
+-- mutation epoch moves (item/slot/upgrade events, magnifier switches, option
+-- changes, device writes).
+local eligibility = {}
+local eligibility_epoch = -1
+
+-- Returns true only for a positively identified iron/non-optical sightline.
+function freezoom_eligible(snapshot)
+	if not (snapshot and snapshot.item and snapshot.cast and snapshot.zoomed and snapshot.state == 0) then
+		return false, "not-idle-ads"
+	end
+	local current = mutation_epoch()
+	if eligibility_epoch ~= current then
+		eligibility_epoch = current
+		eligibility = {}
+	end
+	local id = snapshot.id
+	local sight = sight_section(snapshot.item)
+	local entry = id ~= nil and eligibility[id] or nil
+	if entry and entry.section == snapshot.section and entry.sight == sight and entry.zoom_type == snapshot.zoom_type then
+		return entry.eligible, entry.reason
+	end
+	scoped_item = snapshot.item
+	scoped_upgrades = collect_upgrades(snapshot.item)
+	scoped_sight = sight
+	local eligible, reason = evaluate_eligibility(snapshot)
+	scoped_item = nil
+	scoped_upgrades = nil
+	scoped_sight = nil
+	if id ~= nil then
+		eligibility[id] = {
+			section = snapshot.section, sight = sight, zoom_type = snapshot.zoom_type,
+			eligible = eligible, reason = reason,
+		}
+	end
+	return eligible, reason
+end
+
+
+function hostile_living(object)
+	if not (object and object_alive(object)) then return false end
+	if object_id(object) == (AC_ID or 0) then return false end
+	local monster, ok = call(IsMonster, object)
+	if ok and yes(monster, false) then return true end
+	local player = actor(true)
+	local relation, ok = method(object, "relation", player)
+	return ok and tonumber(relation) ~= nil and tonumber(relation) >= (game_object and game_object.enemy or 2)
+end

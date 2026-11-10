@@ -1,0 +1,438 @@
+-- Advanced Player Behavior v2: Suit Setups forward-queue partial.
+--
+-- install(Service, C) attaches the forward half of the switch service to the
+-- Service class owned by apb_v2_suit_transaction: the actions that clear the
+-- belt, swap the suit and helmet, re-belt the saved pieces, and the final
+-- piece count that classifies the result.  Bodies are verbatim, so `self` is
+-- still the service and every helper is reached through it; C carries the mode
+-- and timeout constants the transaction owns.  No presentation provider is
+-- named here: the presentation partial builds the plate and outfit animations,
+-- answers the headgear safeguards and hands over the FDDA headgear table
+-- through Service:headgear_api(); this partial decides when they are queued
+-- and where the plate animations go (the outfit builder queues its own).
+
+function install(Service, C)
+	local FORWARD = C.FORWARD
+	local CHECKPOINT_TIMEOUT = C.CHECKPOINT_TIMEOUT
+	local BELT_MOVE_TIMEOUT = C.BELT_MOVE_TIMEOUT
+	local append_action = C.append_action
+
+	function Service:belt_equip_candidate(tx, ref, report_failure)
+		local actor = self:actor()
+		local outfit = tx and self.equipment.resolve_ref(tx.setup.suit, IsOutfit, actor) or nil
+		if not outfit or not self:slot_matches(7, tx and tx.setup.suit or nil) then
+			if report_failure then
+				self:mark_fatal(tx, "target suit was lost before belt setup")
+			end
+			return nil
+		end
+
+		local item = self.equipment.resolve_belt_ref(ref, actor)
+		if not item then
+			if report_failure then
+				self:mark_partial(tx, "belt", ref.section .. " is not carried")
+			end
+			return nil
+		end
+		if self:belt_contains(ref) then
+			return item, true
+		end
+
+		if not self:belt_admits(actor, outfit, ref) then
+			if report_failure then
+				self:mark_partial(tx, "belt", ref.section .. " does not fit the target belt")
+			end
+			return nil
+		end
+		return item, false
+	end
+
+	function Service:enqueue_forward_belt_transfer(tx, ref)
+		local name = "gss_belt_equip_" .. tostring(ref.object_id)
+		local state = {wait_for_settle = false, sound_played = false}
+		self:enqueue_direct(tx, name, function()
+			if tx.fatal_reason then
+				return
+			end
+			local item, already_equipped = self:belt_equip_candidate(tx, ref, true)
+			if not item or already_equipped then
+				return
+			end
+			tx.mutated = true
+			self:actor():move_to_belt(item)
+			state.wait_for_settle = true
+		end, FORWARD)
+		self:enqueue_checkpoint(tx, name .. "_checkpoint", function()
+			if not state.wait_for_settle then
+				return true
+			end
+			if self:belt_contains(ref) then
+				self:play_settled_belt_sound(tx, state, ref, true)
+				return true
+			end
+			return false
+		end, BELT_MOVE_TIMEOUT, function()
+			self:mark_partial(tx, "belt", ref.section .. " was rejected after the move")
+		end, FORWARD)
+	end
+
+	function Service:enqueue_belt_animation_dispatch(tx, ref, mode)
+		local name = "gss_belt_" .. mode .. "_animation_dispatch_" .. tostring(ref.object_id)
+		self:enqueue_direct(tx, name, function()
+			if tx.fatal_reason then
+				return
+			end
+			if mode == "equip" then
+				local item, already_equipped = self:belt_equip_candidate(tx, ref, false)
+				if not item or already_equipped then
+					return
+				end
+			else
+				if not self.equipment.resolve_ref(tx.setup.suit, IsOutfit, self:actor()) then
+					self:mark_fatal(tx, "target suit vanished before belt preclear")
+					return
+				end
+				if not self:belt_contains(ref) then
+					return
+				end
+			end
+			local animation = self:make_belt_animation(tx, ref, mode)
+			if animation then
+				self:trace("slot %d queued FDDA plate %s animation for %s", tx.index, mode, ref.section)
+				tx.queue:enqueue_first(animation)
+			end
+		end, FORWARD)
+	end
+
+	function Service:enqueue_preclear_belt(tx)
+		for _, ref in ipairs(tx.before.belt or {}) do
+			self:enqueue_belt_animation_dispatch(tx, ref, "unequip")
+			self:enqueue_belt_move_out(tx, ref, "gss_belt_preclear_" .. tostring(ref.object_id), FORWARD, function()
+				return not tx.fatal_reason
+			end, true, function()
+				self:mark_fatal(tx, ref.section .. " did not leave the belt before suit removal")
+			end)
+		end
+
+		self:enqueue_checkpoint(tx, "gss_belt_preclear_checkpoint", function()
+			return self:actor():belt_count() == 0
+		end, CHECKPOINT_TIMEOUT, function()
+			self:mark_fatal(tx, "current belt could not be cleared safely")
+		end, FORWARD)
+	end
+
+	function Service:enqueue_suit_switch(tx)
+		if self.equipment.same_ref(tx.before.suit, tx.setup.suit) then
+			self:enqueue_direct(tx, "gss_outfit_already_equipped", function()
+				if not self:slot_matches(7, tx.setup.suit) then
+					self:mark_fatal(tx, "equipped suit changed before setup application")
+				end
+			end, FORWARD)
+			return
+		end
+
+		self:enqueue_direct(tx, "gss_outfit_unequip", function()
+			if tx.fatal_reason then
+				return
+			end
+			local actor = self:actor()
+			local target = self.equipment.resolve_ref(tx.setup.suit, IsOutfit, actor)
+			local current = actor:item_in_slot(7)
+			local current_ref = self.equipment.actor_owns(current, actor) and self.equipment.make_ref(current) or nil
+			if not target then
+				self:mark_fatal(tx, "target suit vanished before current suit was removed")
+				return
+			end
+			if not self.equipment.same_ref(current_ref, tx.before.suit) then
+				self:mark_fatal(tx, "worn suit changed before unequip")
+				return
+			end
+			if actor:belt_count() ~= 0 then
+				self:mark_fatal(tx, "belt was not empty before suit unequip")
+				return
+			end
+			if current then
+				tx.mutated = true
+				actor:move_to_ruck(current)
+			end
+		end, FORWARD)
+
+		self:enqueue_checkpoint(tx, "gss_outfit_empty_checkpoint", function()
+			return not self:actor():item_in_slot(7)
+		end, CHECKPOINT_TIMEOUT, function()
+			self:mark_fatal(tx, "current suit did not leave its slot")
+		end, FORWARD)
+
+		self:enqueue_direct(tx, "gss_outfit_equip", function()
+			if tx.fatal_reason then
+				return
+			end
+			local actor = self:actor()
+			local target = self.equipment.resolve_ref(tx.setup.suit, IsOutfit, actor)
+			if not target then
+				self:mark_fatal(tx, "target suit vanished before equip")
+				return
+			end
+			if actor:item_in_slot(7) then
+				self:mark_fatal(tx, "suit slot was occupied before target equip")
+				return
+			end
+			tx.mutated = true
+			actor:move_to_slot(target, 7)
+		end, FORWARD)
+
+		self:enqueue_checkpoint(tx, "gss_outfit_checkpoint", function()
+			return self:slot_matches(7, tx.setup.suit)
+		end, CHECKPOINT_TIMEOUT, function()
+			self:mark_fatal(tx, "target suit did not settle in its slot")
+		end, FORWARD)
+		self:enqueue_outfit_animation(tx)
+	end
+
+	function Service:enqueue_helmet_dispatch(tx)
+		self:enqueue_direct(tx, "gss_helmet_dispatch", function()
+			if tx.fatal_reason then
+				return
+			end
+			if not tx.setup.helmet then
+				self:trace("slot %d helmet wildcard kept current helmet", tx.index)
+				return
+			end
+
+			local actor = self:actor()
+			local target_ref = tx.setup.helmet
+			local target = self.equipment.resolve_ref(target_ref, IsHeadgear, actor)
+			if not target then
+				self:mark_partial(tx, "helmet", "saved helmet is not carried; current helmet kept")
+				return
+			end
+
+			local current = actor:item_in_slot(12)
+			local current_ref = self.equipment.actor_owns(current, actor) and self.equipment.make_ref(current) or nil
+			if self.equipment.same_ref(current_ref, target_ref) then
+				self:trace("slot %d saved helmet already equipped", tx.index)
+				return
+			end
+
+			tx.helmet_sequence_allowed = true
+			local api = self:headgear_api()
+			local animation_requested = self:fdda_animation_enabled("headgear_anm/enable")
+			local animate = animation_requested and api and api.ta_animation_equip and api.ta_animation_unequip
+			if animation_requested and not animate then
+				self:mark_partial(tx, "animation", "headgear animation API was unavailable")
+			end
+			local actions = {}
+			local current_section = current and current:section() or nil
+			local target_section = target:section()
+			local function native(name, factory, ...)
+				append_action(actions, tx.queue:try_native_action(name, factory, ...))
+			end
+			local function native_nvg(name, factory, ...)
+				append_action(actions, tx.queue:try_nvg_action(name, factory, ...))
+			end
+
+			local function restore_previous_helmet()
+				local live_actor = self:actor()
+				if not live_actor or live_actor:item_in_slot(12) then
+					return
+				end
+				local previous = self.equipment.resolve_ref(current_ref, IsHeadgear, live_actor)
+				if previous then
+					live_actor:move_to_slot(previous, 12)
+				end
+			end
+
+			local function previous_helmet_settled()
+				if current_ref then
+					return self:slot_matches(12, current_ref)
+				end
+				return not self:actor():item_in_slot(12)
+			end
+
+			if current_section then
+				if animate and not self:helmet_skips_nvg(current_section) and api.ta_try_set_nightvision then
+					native_nvg("helmet NVG off", api.ta_try_set_nightvision, false)
+				end
+				if animate and self:helmet_uses_fade(current_section) and api.ta_unequip_fade then
+					native("helmet fade", api.ta_unequip_fade)
+				end
+				if animate and not self:helmet_is_blacklisted(current_section) then
+					if api.ta_mask_hud_off then
+						native("helmet mask off", api.ta_mask_hud_off, true)
+					end
+					native("helmet unequip", api.ta_animation_unequip, current_section)
+				end
+
+				self:enqueue_direct(tx, "gss_helmet_unequip", function()
+					if not tx.helmet_sequence_allowed then
+						return
+					end
+					if not self.equipment.resolve_ref(target_ref, IsHeadgear, self:actor()) then
+						tx.helmet_sequence_allowed = false
+						self:mark_partial(tx, "helmet", "saved helmet vanished before current helmet was removed")
+						return
+					end
+					local live_actor = self:actor()
+					local worn = live_actor:item_in_slot(12)
+					local worn_ref = self.equipment.actor_owns(worn, live_actor) and self.equipment.make_ref(worn) or nil
+					if not self.equipment.same_ref(worn_ref, current_ref) then
+						tx.helmet_sequence_allowed = false
+						self:mark_partial(tx, "helmet", "worn helmet changed during the switch")
+						return
+					end
+					if worn then
+						tx.mutated = true
+						live_actor:move_to_ruck(worn)
+					end
+				end, FORWARD, actions)
+
+				self:enqueue_checkpoint(tx, "gss_helmet_empty_checkpoint", function()
+					return not tx.helmet_sequence_allowed or not self:actor():item_in_slot(12)
+				end, CHECKPOINT_TIMEOUT, function()
+					tx.helmet_sequence_allowed = false
+					self:mark_partial(tx, "helmet", "current helmet did not leave its slot")
+					restore_previous_helmet()
+				end, FORWARD, actions)
+
+				if animate and not self:helmet_is_blacklisted(current_section) and api.ta_mask_hud_off then
+					native("helmet mask restore", api.ta_mask_hud_off, false)
+				end
+			end
+
+			if animate and not self:helmet_skips_nvg(target_section) and api.ta_try_set_nightvision then
+				native_nvg("target helmet NVG off", api.ta_try_set_nightvision, false)
+			end
+			if animate and not self:helmet_is_blacklisted(target_section) then
+				native("target helmet equip", api.ta_animation_equip, target_section)
+			end
+
+			self:enqueue_direct(tx, "gss_helmet_equip", function()
+				if not tx.helmet_sequence_allowed then
+					return
+				end
+				local live_actor = self:actor()
+				local helmet = self.equipment.resolve_ref(target_ref, IsHeadgear, live_actor)
+				if not helmet then
+					tx.helmet_sequence_allowed = false
+					self:mark_partial(tx, "helmet", "saved helmet vanished before equip")
+					restore_previous_helmet()
+					return
+				end
+				if live_actor:item_in_slot(12) then
+					tx.helmet_sequence_allowed = false
+					self:mark_partial(tx, "helmet", "helmet slot was occupied before equip")
+					restore_previous_helmet()
+					return
+				end
+				tx.mutated = true
+				live_actor:move_to_slot(helmet, 12)
+			end, FORWARD, actions)
+
+			self:enqueue_checkpoint(tx, "gss_helmet_checkpoint", function()
+				if tx.helmet_sequence_allowed then
+					return self:slot_matches(12, target_ref)
+				end
+				return previous_helmet_settled()
+			end, CHECKPOINT_TIMEOUT, function()
+				tx.helmet_sequence_allowed = false
+				self:mark_partial(tx, "helmet", "helmet switch and fallback did not settle")
+				restore_previous_helmet()
+			end, FORWARD, actions)
+
+			self:enqueue_checkpoint(tx, "gss_helmet_fallback_checkpoint", function()
+				if tx.helmet_sequence_allowed then
+					return true
+				end
+				return previous_helmet_settled()
+			end, CHECKPOINT_TIMEOUT, function()
+				self:mark_partial(tx, "helmet", "previous helmet could not be restored")
+			end, FORWARD, actions)
+
+			tx.headgear_queue_started = animate and true or false
+			self:trace("slot %d injected helmet sequence (%s)", tx.index, animate and "animated" or "moves only")
+			tx.queue:inject_sequence(actions)
+		end, FORWARD)
+	end
+
+	function Service:enqueue_belt_switch(tx)
+		self:enqueue_direct(tx, "gss_belt_post_suit_clear_dispatch", function()
+			if tx.fatal_reason then
+				return
+			end
+			local actions = {}
+			for _, ref in ipairs(self.equipment.capture_belt(self:actor())) do
+				local animation = self:make_belt_animation(tx, ref, "unequip")
+				if animation then
+					self:trace("slot %d queued FDDA plate unequip animation for %s", tx.index, ref.section)
+				end
+				append_action(actions, animation)
+				self:enqueue_belt_move_out(tx, ref, "gss_belt_post_suit_" .. tostring(ref.object_id), FORWARD, function()
+					return not tx.fatal_reason
+				end, false, function()
+					self:mark_partial(tx, "belt", ref.section .. " remained after the suit callback")
+				end, actions)
+			end
+			if #actions > 0 then
+				self:trace("slot %d injected post-suit belt clear (%d actions)", tx.index, #actions)
+				tx.queue:inject_sequence(actions)
+			end
+		end, FORWARD)
+
+		self:enqueue_checkpoint(tx, "gss_belt_post_suit_checkpoint", function()
+			return self:actor():belt_count() == 0
+		end, CHECKPOINT_TIMEOUT, function()
+			self:mark_partial(tx, "belt", "an automatic belt callback left an item equipped")
+		end, FORWARD)
+
+		for _, ref in ipairs(tx.setup.belt or {}) do
+			self:enqueue_belt_animation_dispatch(tx, ref, "equip")
+			self:enqueue_forward_belt_transfer(tx, ref)
+		end
+	end
+
+	function Service:final_piece_counts(setup)
+		local missing = 0
+		local rejected = 0
+		local wanted = {}
+		if setup.helmet then
+			local helmet = self.equipment.resolve_ref(setup.helmet, IsHeadgear, self:actor())
+			if not helmet then
+				missing = missing + 1
+			elseif not self:slot_matches(12, setup.helmet) then
+				rejected = rejected + 1
+			end
+		end
+		for _, ref in ipairs(setup.belt) do
+			wanted[self.equipment.ref_key(ref)] = true
+			local obj = self.equipment.resolve_belt_ref(ref, self:actor())
+			if not obj then
+				missing = missing + 1
+			elseif not self:belt_contains(ref) then
+				rejected = rejected + 1
+			end
+		end
+		for _, ref in ipairs(self.equipment.capture_belt(self:actor())) do
+			if not wanted[self.equipment.ref_key(ref)] then
+				rejected = rejected + 1
+			end
+		end
+		return missing, rejected
+	end
+
+	function Service:enqueue_forward(tx)
+		self:enqueue_direct(tx, "gss_preflight", function()
+			if not self.equipment.resolve_ref(tx.setup.suit, IsOutfit, self:actor()) then
+				self:mark_fatal(tx, "exact saved suit is no longer carried")
+			end
+		end, FORWARD)
+		self:enqueue_preclear_belt(tx)
+		self:enqueue_suit_switch(tx)
+		self:enqueue_helmet_dispatch(tx)
+		self:enqueue_belt_switch(tx)
+		tx.queue:enqueue(tx.queue:delay("gss_final_settle", 0.2, FORWARD))
+		self:enqueue_direct(tx, "gss_queue_complete", function()
+			tx.queue_complete = true
+			self:trace("slot %d reached queue sentinel", tx.index)
+		end, FORWARD)
+	end
+end

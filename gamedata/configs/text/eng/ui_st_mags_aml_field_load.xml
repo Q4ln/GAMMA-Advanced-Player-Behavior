@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<string_table>
+    <string id="ui_mcm_menu_mags_aml_field_load">
+        <text>Mags: AML Field Loading</text>
+    </string>
+    <string id="ui_mcm_mags_aml_field_load_enabled">
+        <text>Enable Reload-hold field loading</text>
+    </string>
+    <string id="ui_mcm_mags_aml_field_load_chamber_animation">
+        <text>Animate mismatched chamber ejection</text>
+    </string>
+    <string id="ui_mcm_mags_aml_field_load_hold_time">
+        <text>Reload hold threshold (seconds)</text>
+    </string>
+    <string id="ui_mcm_mags_aml_field_load_load_speed">
+        <text>AML loading animation speed</text>
+    </string>
+    <string id="ui_mcm_mags_aml_field_load_unload_speed">
+        <text>AML unloading animation speed</text>
+    </string>
+    <string id="ui_mcm_mags_aml_field_load_description">
+        <text>Tap Reload: a healthy weapon queues ammunition choice on release, while a jam routes to unjam. With one or more actionable alternatives the selector stays open; zero closes immediately. Zero does nothing for a detachable-mag weapon so Mags cannot substitute another magazine, while internal and magless weapons use canonical Reload. Pressing Reload again while the selector is open closes it without reloading. For a detachable-mag weapon, the current-ammo entry is grey when no matching equipped magazine is fuller. For internal and magless weapons, the current type is grey only when the weapon is full. Choosing either redundant entry closes the selector without action. A matching retained chamber round stays chambered; a mismatched one is returned to inventory. When enabled and supported by the weapon, its misfire animation plays before that mismatched round is removed; unsupported weapons continue immediately. Hold Reload past the threshold (even with empty hands) to process compatible equipped magazines. A selected magazine without an explicit choice follows its loaded top-round family automatically, while an empty one uses its first clean configured type. The active weapon is first, with its current ammunition family first; remaining equipped weapons follow by slot number. Every magazine receives its own AML show/load/hide sequence. If the batch includes the magazine inserted in the active weapon, a visual-only weapon reload is attempted before its exact logical ejection; AML loads that exact magazine, it is immediately reinserted, and the second visual-only reload is attempted before loose-magazine AML sessions continue, even while inventory is open. These bookends play the weapon's authored reload sound, do not exchange ammunition, and stay outside Dynamic Reload Speeds. Jumping, sprinting, falling, or pressing Reload again cancels the batch. Right-click a selected magazine to choose another ammo family directly; there is no cycling or Clear assignment action. The context menu contains actions only, while the tooltip displays the effective assignment. Any magazine inserted in an equipped weapon becomes selected under that exact weapon ID using its top/default ammunition; loose non-loadout magazines remain untouched. An inserted selected magazine keeps its assignment dormant when the weapon moves into inventory. Returning the same logical weapon preserves it; equipping another identical copy does not share it. Compatible attachment and unjam clones inherit the dormant assignment as part of the logical magazine data. Loose non-loadout and reserve magazines are ignored by field loading. Assigned/default ammunition is exclusive: if it is unavailable, that magazine is skipped and the batch continues with other eligible magazines. Dragging another ammunition type onto an assigned magazine does nothing. AML never substitutes ammunition or rewrites the assignment. A completed hold never becomes an ordinary tap reload, even when no ammunition is available. Genuine Mags reloads retain Dynamic Reload Speeds animation, sound, per-mag, and speed-loader timing, while Mags alone owns the exact magazine ammunition count. AML speeds are independent from Dynamic Reload Speeds.</text>
+    </string>
+    <string id="ui_mags_aml_assignment_prefix">
+        <text>Assigned ammo:</text>
+    </string>
+    <string id="ui_mags_aml_assign_action">
+        <text>Assign: %s</text>
+    </string>
+</string_table>

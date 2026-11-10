@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<string_table>
+    <string id="ui_mcm_menu_advanced_player_behavior"><text>Advanced Player Behavior</text></string>
+
+    <string id="ui_apb_mcm_stance_controls"><text>Stance Controls</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_enabled"><text>Enable stance controls</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_enabled_desc"><text>Use Crouch and Jump to control standing, crouching, and the native lowest stance without another keybind.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_hold_threshold_ms"><text>Hold threshold (milliseconds)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_hold_threshold_ms_desc"><text>Release before this time for a tap. Reaching the threshold counts as a hold. Default: 250 ms.</text></string>
+
+    <string id="ui_apb_mcm_weapon_readiness"><text>Adaptive Weapon Readiness</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_enabled"><text>Enable adaptive readiness</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_enabled_desc"><text>Lower supported weapons during peace and raise them for combat, hostile attacks, aiming, or firing.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_calm_delay_ms"><text>Calm delay (milliseconds)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_calm_delay_ms_desc"><text>Keep the weapon ready this long after the final readiness source clears, then lower it at the first safe idle update. Default: 2000 ms.</text></string>
+
+    <string id="ui_apb_mcm_smart_visor_wiping"><text>Smart Visor Wiping</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_enabled"><text>Enable smart visor wiping</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_enabled_desc"><text>Request the installed native visor wipe when rain droplets reach the configured level. Combat, an idle raised weapon, and sprint do not block the request.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_trigger_percent"><text>Wipe trigger (percent)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_trigger_percent_desc"><text>Queue a wipe when global visor wetness reaches this percentage. Default: 30%.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_rearm_percent"><text>Re-arm level (percent)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_rearm_percent_desc"><text>Wetness must fall to this value before another automatic wipe can arm. It is normalized to remain at least 5 points below the trigger. Default: 10%.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_min_interval_seconds"><text>Minimum interval (seconds)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_min_interval_seconds_desc"><text>Minimum time after a completed automatic or manual wipe before another automatic wipe. Default: 30 seconds.</text></string>
+
+    <string id="ui_apb_mcm_contextual_equipment"><text>Contextual Equipment</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_enabled"><text>Enable contextual equipment controls</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_enabled_desc"><text>Give Headlamp contextual tap and hold behavior for lamp, night vision, aim modes, scope visuals, and BAS laser hue.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_hold_threshold_ms"><text>Equipment hold threshold (milliseconds)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_hold_threshold_ms_desc"><text>Release before this time for the contextual tap. Reaching the threshold performs the contextual hold. Default: 350 ms.</text></string>
+
+    <string id="ui_apb_mcm_unscoped_free_zoom"><text>Unscoped ADS Free Zoom</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_unscoped_free_zoom_enabled"><text>Enable unscoped ADS Free Zoom</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_unscoped_free_zoom_enabled_desc"><text>Remember normal or maximum Free Zoom globally per save for positively identified unscoped primary and non-optical alternate ADS.</text></string>
+
+    <string id="ui_apb_mcm_suit_setups"><text>Suit Setups</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_suit_setups_open_wheel"><text>Suit Setup Wheel</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_suit_setups_open_wheel_desc"><text>Hold to open the eight-slot wheel. Aim with the mouse and left-click a ready or partial setup to apply it. Unbound by default.</text></string>
+    <string id="ui_apb_mcm_suit_setups_manager_note"><text>The setup manager is available from any actor-owned outfit. Wheel slow motion follows Haru Quick Action Wheel.</text></string>
+
+</string_table>

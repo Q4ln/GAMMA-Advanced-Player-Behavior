@@ -1,0 +1,601 @@
+-- Advanced Player Behavior v2: event-woken three-height stance controller.
+-- Stance state is intentionally session-only and is never written to saves.
+-- The realized stance is sampled from the adapter per use rather than cached.
+
+local api = apb_v2_core
+local player = apb_v2_player_adapter
+local ID = "stance"
+
+local enabled = false
+local committed = 0
+local requested = 0
+local gesture = nil
+local pending_raise = nil
+local sprint_buffer = nil
+local jump_pulse = nil
+local swallowed = {}
+local accel_claims = {}
+local suspended = nil
+local adopt_next = true
+local update_index = 0
+-- Teleport baseline: two module-scope scratch samples whose fields are
+-- overwritten in place, so no table is allocated per update; has_last is the
+-- reset flag.
+local has_last = false
+local last_sample = { x = 0, y = 0, z = 0 }
+local current_sample = { x = 0, y = 0, z = 0 }
+-- The DIK of a lowered Jump whose hold the ledge script was told about, until
+-- its physical release.
+local ledge_hold_dik = nil
+
+
+local function action_edge(phase, action, fallback)
+	if not action then return false end
+	local dik = api.action_dik(action, fallback)
+	if not dik then return false end
+	local _, ok = api.synthetic_action(phase, dik, action, false)
+	return ok and true or false
+end
+
+
+local function jump_edge(phase, fallback)
+	local ledge = demonized_ledge_grabbing
+	local settings = ledge and ledge.settings or nil
+	if not settings then return action_edge(phase, key_bindings.kJUMP, fallback) end
+	local previous = settings.keybind
+	settings.keybind = -1
+	local ok, result = pcall(action_edge, phase, key_bindings.kJUMP, fallback)
+	settings.keybind = previous
+	return ok and result or false
+end
+
+
+local function downward_edges(from, target)
+	if from < 1 and target >= 1 then action_edge("press", key_bindings.kCROUCH) end
+	if from < 2 and target >= 2 then action_edge("press", key_bindings.kACCEL) end
+end
+
+
+local function upward_edges(from, target)
+	if from >= 2 and target < 2 then action_edge("release", key_bindings.kACCEL) end
+	if from >= 1 and target < 1 then action_edge("release", key_bindings.kCROUCH) end
+end
+
+
+local function drive()
+	if requested >= 1 then action_edge("hold", key_bindings.kCROUCH) end
+	if requested >= 2 then action_edge("hold", key_bindings.kACCEL) end
+end
+
+
+local function release_jump_pulse(reason)
+	local state = jump_pulse
+	if not state then return end
+	jump_pulse = nil
+	jump_edge("release", state.dik)
+	if reason then api.log_info("STANCE", "Jump pulse released | reason=%s", tostring(reason)) end
+end
+
+
+local function start_jump_pulse(dik)
+	release_jump_pulse(nil)
+	if not jump_edge("press", dik) then return false end
+	jump_pulse = { dik = dik, at = api.now_ms(), update = update_index }
+	return true
+end
+
+
+local function handoff_accel()
+	for dik, _ in pairs(accel_claims) do
+		accel_claims[dik] = nil
+		if api.confirmed_down(dik) then
+			action_edge("press", key_bindings.kACCEL, dik)
+			action_edge("hold", key_bindings.kACCEL, dik)
+			break
+		end
+	end
+end
+
+
+local function begin_raise(origin, target, kind)
+	pending_raise = {
+		origin = origin,
+		target = target,
+		kind = kind,
+		at = api.now_ms(),
+		update = update_index,
+	}
+	requested = target
+end
+
+
+local function finish_sprint(success)
+	local state = sprint_buffer
+	if not state then return end
+	if success then
+		action_edge("press", key_bindings.kSPRINT_TOGGLE, state.dik)
+		if state.released then
+			action_edge("release", key_bindings.kSPRINT_TOGGLE, state.dik)
+		else
+			action_edge("hold", key_bindings.kSPRINT_TOGGLE, state.dik)
+		end
+	end
+	if not success and not state.released then swallowed[state.dik] = true end
+	sprint_buffer = nil
+	api.log_info("STANCE", "Sprint auto-stand %s", success and "confirmed" or "blocked")
+end
+
+
+local function settle_raise(current)
+	local state = pending_raise
+	if not state or update_index <= state.update then return end
+	local realized = player.realized_stance()
+	if realized == state.target then
+		pending_raise = nil
+		requested = state.target
+		committed = state.target
+		upward_edges(state.origin, state.target)
+		if state.target == 0 then handoff_accel() end
+		if state.kind == "sprint" then finish_sprint(true) end
+		return
+	end
+	if update_index - state.update < 2 and current - state.at < 100 then return end
+	pending_raise = nil
+	if realized < state.origin then downward_edges(realized, state.origin) end
+	requested = state.origin
+	committed = state.origin
+	if state.kind == "sprint" then finish_sprint(false) end
+	drive()
+	api.log_info("STANCE", "Raise blocked | kind=%s origin=%d realized=%d", tostring(state.kind), state.origin, realized)
+end
+
+
+local function reconcile_committed(kind)
+	local realized = player.realized_stance()
+	requested = committed
+	if realized < committed then
+		downward_edges(realized, committed)
+	elseif realized > committed then
+		begin_raise(realized, committed, kind or "reconcile")
+	elseif committed == 0 then
+		handoff_accel()
+	end
+end
+
+
+local function cancel_gesture(reason)
+	local had_work = gesture ~= nil or pending_raise ~= nil or sprint_buffer ~= nil or jump_pulse ~= nil
+	if not had_work then return end
+	if gesture then swallowed[gesture.dik] = true end
+	if sprint_buffer and not sprint_buffer.released then swallowed[sprint_buffer.dik] = true end
+	gesture = nil
+	pending_raise = nil
+	sprint_buffer = nil
+	release_jump_pulse(reason)
+	reconcile_committed("cancel")
+end
+
+
+local function enter_suspension(reason, destructive)
+	if not suspended then suspended = { saved = committed, adopt = false } end
+	if destructive then suspended.adopt = true end
+	cancel_gesture("context-" .. tostring(reason))
+	pending_raise = nil
+	requested = player.realized_stance()
+end
+
+
+local function update_suspension()
+	-- No snapshot: the adapter resolves the quick-melee slot itself.
+	local blocked, reason, destructive = player.presentation_blocked(nil, true)
+	if blocked then
+		enter_suspension(reason, destructive)
+		return true
+	end
+	if not suspended then return false end
+	local state = suspended
+	suspended = nil
+	if state.adopt then
+		committed = player.realized_stance()
+		requested = committed
+	else
+		committed = state.saved
+		reconcile_committed("context-restore")
+	end
+	return false
+end
+
+
+local function past_hold_threshold(state)
+	return api.now_ms() - state.at >= api.get_setting("v2_stance_controls/hold_threshold_ms")
+end
+
+
+local function lowered_or_lowering()
+	return committed > 0 or requested > 0 or player.realized_stance() > 0
+end
+
+
+local function classify_jump(state)
+	if state.classified or not past_hold_threshold(state) then return end
+	state.classified = true
+	if not player.climbing() then begin_raise(state.origin, state.target, "jump-hold") end
+end
+
+
+-- Takes the live gesture and ends it as a tap or a hold.
+local function finish_gesture()
+	local state = gesture
+	if not state then return end
+	gesture = nil
+	local held = state.classified or past_hold_threshold(state)
+	if state.kind == "crouch" then
+		if held then
+			committed = state.origin
+			if state.target > state.origin then begin_raise(state.target, state.origin, "crouch-hold-release") end
+		else
+			committed = state.target
+			requested = state.target
+		end
+	elseif state.kind == "jump" then
+		if player.climbing() then return end
+		if held then
+			if not state.classified then begin_raise(state.origin, state.target, "jump-hold-release") end
+		else
+			start_jump_pulse(state.dik)
+		end
+	end
+end
+
+
+local function detect_teleport()
+	local actor = player.actor(true)
+	local position = actor and api.safe_method(actor, "position") or nil
+	if not position then
+		has_last = false
+		return
+	end
+	local sample = current_sample
+	sample.x = tonumber(position.x) or 0
+	sample.y = tonumber(position.y) or 0
+	sample.z = tonumber(position.z) or 0
+	if has_last and not suspended then
+		local dx = sample.x - last_sample.x
+		local dy = sample.y - last_sample.y
+		local dz = sample.z - last_sample.z
+		if dx * dx + dy * dy + dz * dz > 144 then
+			reset("teleport")
+			adopt_next = false
+			api.log_info("STANCE", "Teleport-like movement adopted realized stance")
+		end
+	end
+	last_sample.x, last_sample.y, last_sample.z = sample.x, sample.y, sample.z
+	has_last = true
+end
+
+
+local function begin_crouch(dik)
+	local origin = committed
+	local target = origin < 2 and origin + 1 or origin
+	gesture = { kind = "crouch", dik = dik, at = api.now_ms(), origin = origin, target = target }
+	if target > origin then
+		downward_edges(origin, target)
+		requested = target
+	end
+	api.wake(ID, 0)
+	return true
+end
+
+
+-- The copy of demonized_ledge_grabbing in Jack Harris's Anti Lag (GAMMA's
+-- development branch) looks for a ledge only while its own on_key_press and
+-- on_key_release callbacks see Jump held.  A lowered Jump is taken here and
+-- never reaches those callbacks, so its hold is reported to them from the
+-- press to the physical release.  The standalone mod has no such functions.
+local function ledge_hold_edge(name, dik)
+	local ledge = demonized_ledge_grabbing
+	local handler = ledge and ledge[name]
+	if type(handler) ~= "function" then return false end
+	local ok, err = pcall(handler, dik)
+	if not ok then api.log_error("STANCE", "Ledge hold %s failed: %s", name, tostring(err)) end
+	return true
+end
+
+
+local function end_ledge_hold()
+	local dik = ledge_hold_dik
+	if not dik then return end
+	ledge_hold_dik = nil
+	ledge_hold_edge("ledge_grabbing_on_key_release", dik)
+end
+
+
+local function begin_ledge_hold(dik)
+	end_ledge_hold()
+	if ledge_hold_edge("ledge_grabbing_on_key_press", dik) then ledge_hold_dik = dik end
+end
+
+
+local function begin_jump(dik)
+	local ledge = demonized_ledge_grabbing
+	if ledge and type(ledge.on_key_press) == "function" then
+		local ok, err = pcall(ledge.on_key_press, dik)
+		if not ok then api.log_error("STANCE", "Ledge offer failed: %s", tostring(err)) end
+	end
+	begin_ledge_hold(dik)
+	gesture = { kind = "jump", dik = dik, at = api.now_ms(), origin = committed, target = committed - 1 }
+	api.wake(ID, 0)
+	return true
+end
+
+
+local function begin_sprint(dik)
+	sprint_buffer = { dik = dik, released = false }
+	begin_raise(committed, 0, "sprint")
+	api.wake(ID, 0)
+	return true
+end
+
+
+-- Whether stance takes a press of this bind: Walk only while lowered or
+-- lowering, the others outside a presentation block, Jump and Sprint only
+-- from a lowered commit.
+local function claims(bind)
+	if bind == key_bindings.kACCEL then return lowered_or_lowering() end
+	if player.presentation_blocked(nil, true) then return false end
+	return bind == key_bindings.kCROUCH or committed > 0
+end
+
+
+-- The press path, shared by a press read down and a deferred press run at its
+-- release.
+local function press(dik, bind)
+	if bind ~= key_bindings.kACCEL then cancel_gesture("newest-input") end
+	if not claims(bind) then return false end
+	if bind == key_bindings.kACCEL then
+		accel_claims[dik] = true
+		api.wake(ID, 0)
+		return true
+	end
+	if bind == key_bindings.kCROUCH then return begin_crouch(dik) end
+	if bind == key_bindings.kJUMP then return begin_jump(dik) end
+	-- The core routes only the descriptor's claim binds here, so this is kSPRINT_TOGGLE.
+	return begin_sprint(dik)
+end
+
+
+function init(core)
+	api = core or apb_v2_core
+end
+
+
+function on_option_change()
+	local wanted = api.get_setting("v2_stance_controls/enabled")
+	-- Asserted on every pass, not only on the enable/disable edges: a stance
+	-- that starts up already disabled never takes either edge, and the core
+	-- skips this module's wake-only routes while the flag is off.
+	api.set_active(ID, wanted)
+	if wanted then
+		if enabled then return end
+		enabled = true
+		committed = player.realized_stance()
+		requested = committed
+		adopt_next = false
+		-- The core's console registry snapshots both toggles (persistently, so
+		-- the player's own values survive a restart), forces them off,
+		-- re-verifies every 500 ms and restores them when stance is disabled.
+		api.own_console("g_crouch_toggle", false, 500)
+		api.own_console("g_walk_toggle", false, 500)
+		return
+	end
+	if enabled then
+		enabled = false
+		cancel_gesture("disabled")
+		end_ledge_hold()
+		pending_raise = nil
+		api.sleep(ID)
+	end
+	-- Every disabled pass gives the toggles back, including one before this
+	-- session ever enabled stance (switched off at the main menu, say): the
+	-- toggles still hold the 0 forced in an earlier session, so a snapshot
+	-- stored back then is given back here. Without one, release_console
+	-- writes nothing.
+	api.release_console("g_crouch_toggle")
+	api.release_console("g_walk_toggle")
+end
+
+
+function observe_input(input_phase, dik, bind, dis, ...)
+	if not enabled or dis or input_phase ~= "press" or not api.confirmed_down(dik) then return end
+	cancel_gesture("newest-input")
+end
+
+
+function on_key_press(dik, bind, dis)
+	if not enabled or dis then return false end
+	if api.confirmed_down(dik) then return press(dik, bind) end
+	-- A press read as up is a tap whose release shares its input batch, or a
+	-- script's press; one stance would take waits for that release
+	-- (apb_v2_core.defer_press).  FDDA Redone's body search crouches by
+	-- switching g_crouch_toggle on, which stance otherwise holds off, then
+	-- pressing and releasing Crouch in one call, so a Crouch press under that
+	-- toggle goes native (a second guard: those calls run inside a lam2 action,
+	-- which presentation_blocked already declines).
+	if not claims(bind) or (bind == key_bindings.kCROUCH and api.console_bool("g_crouch_toggle")) then return false end
+	return api.defer_press(ID, dik, bind)
+end
+
+
+function on_key_hold(dik, bind, dis)
+	if not enabled then return false end
+	if swallowed[dik] then return true end
+	if gesture and gesture.dik == dik then
+		if gesture.kind ~= "crouch" then classify_jump(gesture) end
+		return true
+	end
+	if sprint_buffer and sprint_buffer.dik == dik then return true end
+	if bind == key_bindings.kACCEL and api.confirmed_down(dik) and lowered_or_lowering() then
+		accel_claims[dik] = true
+		return true
+	end
+	if accel_claims[dik] then return true end
+	return false
+end
+
+
+function on_key_release(dik, bind, dis)
+	if not enabled then return false end
+	-- A deferred press runs now and ends below as a tap; one stance no longer
+	-- takes reaches the native chain ahead of its release.
+	if api.take_deferred_press(ID, dik) and not press(dik, bind) then
+		api.synthetic_action("press", dik, bind, false)
+		return false
+	end
+	if dik == ledge_hold_dik then end_ledge_hold() end
+	if swallowed[dik] then
+		swallowed[dik] = nil
+		return true
+	end
+	if gesture and gesture.dik == dik then
+		finish_gesture()
+		api.wake(ID, 0)
+		return true
+	end
+	if sprint_buffer and sprint_buffer.dik == dik then
+		sprint_buffer.released = true
+		api.wake(ID, 0)
+		return true
+	end
+	-- A Walk release always goes on: with the toggle off the engine ignores it,
+	-- and scripts need it to clear a Shift flag set before stance took the key.
+	accel_claims[dik] = nil
+	return false
+end
+
+
+function on_update(current)
+	if not enabled then return nil end
+	update_index = update_index + 1
+	if not player.actor(true) then
+		adopt_next = true
+		has_last = false
+		return 250
+	end
+	detect_teleport()
+	for dik, _ in pairs(swallowed) do
+		local down, known = api.hardware_down(dik)
+		if known and not down then swallowed[dik] = nil end
+	end
+	if ledge_hold_dik and not api.confirmed_down(ledge_hold_dik) then end_ledge_hold() end
+	if gesture then
+		local down, known = api.hardware_down(gesture.dik)
+		if not known then
+			cancel_gesture("hardware-uncertain")
+		elseif not down then
+			finish_gesture()
+		end
+	end
+	if sprint_buffer and not sprint_buffer.released then
+		local down, known = api.hardware_down(sprint_buffer.dik)
+		if not known then
+			cancel_gesture("sprint-hardware-uncertain")
+		elseif not down then
+			sprint_buffer.released = true
+		end
+	end
+	for dik, _ in pairs(accel_claims) do
+		local down, known = api.hardware_down(dik)
+		if known and not down then accel_claims[dik] = nil end
+	end
+	if update_suspension() then return 50 end
+	if adopt_next then
+		adopt_next = false
+		committed = player.realized_stance()
+		requested = committed
+	end
+	if gesture and gesture.kind ~= "crouch" then classify_jump(gesture) end
+	drive()
+	local realized = player.realized_stance()
+	settle_raise(current)
+	if jump_pulse and (update_index - jump_pulse.update >= 2 or current - jump_pulse.at >= 100) then
+		release_jump_pulse("safety")
+	end
+	if realized == 0 and next(accel_claims) ~= nil then handoff_accel() end
+	if gesture or pending_raise or sprint_buffer or jump_pulse or requested > 0 then return 0 end
+	-- Lowered, or with key bookkeeping still outstanding: keep the 1000 ms
+	-- teleport/housekeeping cadence.  Standing with nothing committed: sleep
+	-- until an input or event wakes the module; the position baseline is
+	-- dropped so the first update after an arbitrarily long sleep cannot read
+	-- ordinary travel as a teleport.
+	if committed > 0 or next(swallowed) ~= nil or next(accel_claims) ~= nil then return 1000 end
+	has_last = false
+	return nil
+end
+
+
+function on_event(name, ...)
+	if not enabled then return end
+	-- Generic HUD motions, movement changes, climb end and vehicle detach are
+	-- wake-only routes (they only dirty the module; update_suspension() polls
+	-- the real blockers) and the teardown names are routed by the core as
+	-- reset(name): neither reaches here.
+	if name == "actor_on_jump" then
+		release_jump_pulse("actor_on_jump")
+	elseif name == "actor_on_climb_start" then
+		enter_suspension("climb", false)
+	elseif name == "actor_on_attach_vehicle" then
+		enter_suspension("vehicle", true)
+	elseif name == "load_complete" or name == "actor_on_first_update" then
+		adopt_next = true
+	end
+	api.wake(ID, 0)
+end
+
+
+function reset(reason)
+	if gesture then swallowed[gesture.dik] = true end
+	gesture = nil
+	pending_raise = nil
+	sprint_buffer = nil
+	release_jump_pulse(reason)
+	end_ledge_hold()
+	suspended = nil
+	committed = player.realized_stance()
+	requested = committed
+	adopt_next = true
+	has_last = false
+end
+
+
+MODULE = {
+	id = ID,
+	priority = 800,
+	events = {
+		"actor_on_jump", "actor_on_climb_start", "actor_on_attach_vehicle",
+		"actor_on_first_update", "load_complete",
+	},
+	resets = { "actor_on_before_death", "actor_on_net_destroy", "on_before_level_changing", "on_level_changing" },
+	wake_only = {
+		"actor_on_hud_animation_play", "actor_on_hud_animation_end", "actor_on_movement_changed",
+		"actor_on_climb_end", "actor_on_detach_vehicle",
+	},
+	optional = {
+		actor_on_climb_start = "demonized_ledge_grabbing",
+		actor_on_climb_end = "demonized_ledge_grabbing",
+	},
+	input = {
+		observe = { "kCROUCH", "kJUMP", "kSPRINT_TOGGLE" },
+		claim = { "kCROUCH", "kJUMP", "kSPRINT_TOGGLE", "kACCEL" },
+	},
+	handlers = {
+		init = init,
+		option_change = on_option_change,
+		update = on_update,
+		event = on_event,
+		reset = reset,
+		key_press = on_key_press,
+		key_hold = on_key_hold,
+		key_release = on_key_release,
+		observe = observe_input,
+	},
+}

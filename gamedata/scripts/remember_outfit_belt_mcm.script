@@ -1,0 +1,6 @@
+-- The legacy automatic outfit-belt memory is replaced by APB Suit Setups.
+-- Returning no option tree removes its now-inapplicable Memory Limit page.
+
+function on_mcm_load()
+	return nil
+end

@@ -1,0 +1,482 @@
+-- Advanced Player Behavior v2: contextual Headlamp/L equipment gesture.
+
+local api = apb_v2_core
+local player = apb_v2_player_adapter
+local device = apb_v2_device_adapter
+local ID = "contextual"
+local GESTURE_FLAG = "contextual_gesture"
+
+local OUT_NV_OFF = "OUT_NV_OFF"
+local OUT_NV_ON = "OUT_NV_ON"
+local PRIMARY = "PRIMARY"
+local ALT_LASER = "ALT_LASER"
+local ALT_OTHER = "ALT_OTHER"
+local OTHER_ADS = "OTHER_ADS"
+
+local enabled = false
+local gesture = nil
+local swallowed = {}
+local suppress_until = 0
+local original_torch = nil
+local torch_wrapper_installed = false
+local bas_callbacks_detached = false
+local bas_original_press = nil
+local bas_original_release = nil
+local bas_original_update = nil
+local laser_owned = false
+-- Presentation ledger: the last (weapon id, visible, section) triple written
+-- to BAS and when.  An identical triple is rewritten only once the 250 ms
+-- reassertion cadence (BAS's own saved-laser reapplication interval, which APB
+-- takes over while it owns the laser) has elapsed; a differing triple is
+-- written at once.  The weapon object id is part of the
+-- key because BAS keys its own saved/visible state per weapon OBJECT, not per
+-- section: drawing a second object of the same section is a different
+-- presentation even though (visible, section) is unchanged, and skipping that
+-- write would leave the new weapon wearing BAS's own laser state.  Cleared on
+-- every restore so a teardown or a re-enable re-asserts from scratch.
+local LASER_REASSERT_MS = 250
+local applied_id = nil
+local applied_visible = nil
+local applied_section = nil
+local applied_at = nil
+
+local torch_wrapper
+local bas_press_wrapper
+
+
+local function log_info(fmt, ...) api.log_info("FIELD", fmt, ...) end
+
+
+local function wake() api.wake(ID, 0) end
+
+
+local function now() return api.now_ms() end
+
+
+-- Publishes whether an L gesture is live (read by the visor through api.flag).
+local function publish_gesture(live) api.set_flag(ID, GESTURE_FLAG, live) end
+
+
+local function classify(snapshot)
+	if snapshot.zoomed then
+		if snapshot.zoom_type == 0 then return PRIMARY end
+		if snapshot.zoom_type == 1 then
+			if device.bas_has_laser(snapshot.section) and device.bas_alt_permitted(snapshot.section) then
+				return ALT_LASER
+			end
+			return ALT_OTHER
+		end
+		return OTHER_ADS
+	end
+	return device.nv_state() and OUT_NV_ON or OUT_NV_OFF
+end
+
+
+local function install_torch_wrapper()
+	if torch_wrapper_installed then return end
+	original_torch = actor_effects.Hit_TorchToggle
+	actor_effects.Hit_TorchToggle = torch_wrapper
+	torch_wrapper_installed = true
+end
+
+
+-- The wrapper can only be taken out while it is still the outermost
+-- Hit_TorchToggle.  When another script has wrapped it since, that wrapper
+-- still calls this one, so this one stays in place -- a pass-through while
+-- the module is disabled -- and keeps original_torch.  Dropping
+-- original_torch there would make the headlamp key do nothing, and a later
+-- re-enable would capture the other wrapper as the "original" and recurse.
+local function restore_torch_wrapper()
+	if not torch_wrapper_installed then return end
+	if actor_effects.Hit_TorchToggle ~= torch_wrapper then return end
+	actor_effects.Hit_TorchToggle = original_torch
+	torch_wrapper_installed = false
+	original_torch = nil
+end
+
+
+-- One-shot: axr_main loads every root script before any on_game_start and
+-- calls them in FS-alphabetical order, so zzz_bas_laser_control has already
+-- registered its three callbacks when APB detaches; nothing in the installed
+-- set re-registers them. A missing BAS module still retries on the next call.
+local function detach_bas_callbacks()
+	local module = device.bas()
+	if not module or bas_callbacks_detached then return end
+	bas_original_press = type(module.on_key_press) == "function" and module.on_key_press or nil
+	bas_original_release = type(module.on_key_release) == "function" and module.on_key_release or nil
+	bas_original_update = type(module.actor_on_update) == "function" and module.actor_on_update or nil
+	if bas_original_press then
+		pcall(UnregisterScriptCallback, "on_key_press", bas_original_press)
+		pcall(RegisterScriptCallback, "on_key_press", bas_press_wrapper)
+	end
+	-- BAS's on_key_release (zzz_bas_laser_control.script:405-416) returns for
+	-- every non-kTORCH dik, so it is unregistered outright rather than wrapped;
+	-- re-audit on any BAS update.
+	if bas_original_release then pcall(UnregisterScriptCallback, "on_key_release", bas_original_release) end
+	if bas_original_update then pcall(UnregisterScriptCallback, "actor_on_update", bas_original_update) end
+	bas_callbacks_detached = true
+end
+
+
+local function restore_bas_callbacks()
+	if not bas_callbacks_detached then return end
+	if bas_original_press then
+		pcall(UnregisterScriptCallback, "on_key_press", bas_press_wrapper)
+		pcall(RegisterScriptCallback, "on_key_press", bas_original_press)
+	end
+	if bas_original_release then pcall(RegisterScriptCallback, "on_key_release", bas_original_release) end
+	if bas_original_update then pcall(RegisterScriptCallback, "actor_on_update", bas_original_update) end
+	bas_callbacks_detached = false
+	bas_original_press = nil
+	bas_original_release = nil
+	bas_original_update = nil
+end
+
+
+local function bas_torch_key(dik)
+	local bind, ok = api.safe_call(dik_to_bind, dik)
+	return ok and bind == key_bindings.kTORCH
+end
+
+
+bas_press_wrapper = function(dik, ...)
+	if enabled and bas_torch_key(dik) then return nil end
+	if bas_original_press then return bas_original_press(dik, ...) end
+	return nil
+end
+
+
+local function torch_suppressed()
+	if not enabled then return false end
+	if gesture or next(swallowed) ~= nil or now() < suppress_until then return true end
+	return api.confirmed_down(api.action_dik(key_bindings.kTORCH))
+end
+
+
+torch_wrapper = function(...)
+	if torch_suppressed() then return nil end
+	if type(original_torch) == "function" then return original_torch(...) end
+	return nil
+end
+
+
+local function real_headlamp_toggle()
+	local bas = device.bas()
+	local _, ok = api.safe_call(bas and bas.TorchToggle or original_torch)
+	return ok
+end
+
+
+local function forget_applied_laser()
+	applied_id = nil
+	applied_visible = nil
+	applied_section = nil
+	applied_at = nil
+end
+
+
+local function restore_laser()
+	forget_applied_laser()
+	if not laser_owned then return end
+	device.bas_restore_saved(player.active_weapon())
+	laser_owned = false
+end
+
+
+-- Writes the wanted triple when it differs from the applied triple or the
+-- applied triple is at least LASER_REASSERT_MS old (BAS's own 250 ms actor
+-- update reapplies saved_lasers, so an owned visible laser is re-asserted at
+-- that cadence); an identical triple inside that window is skipped.  A
+-- different weapon object id always differs, so a weapon swap is written on
+-- the frame the swap is seen even when the wanted (visible, section) pair is
+-- the one already on the ledger.
+local function present_laser(id, visible, section)
+	local current = now()
+	if id == applied_id and visible == applied_visible and section == applied_section and applied_at ~= nil and
+		current - applied_at < LASER_REASSERT_MS then
+		return
+	end
+	if device.bas_set_visible(visible, section) then
+		applied_id = id
+		applied_visible = visible
+		applied_section = section
+		applied_at = current
+	end
+end
+
+
+local function reconcile_laser(snapshot)
+	if not (snapshot.id and snapshot.section and device.bas_has_laser(snapshot.section)) then
+		if laser_owned then device.bas_set_visible(false) end
+		laser_owned = false
+		forget_applied_laser()
+		return false
+	end
+	local visible = (snapshot.zoomed and snapshot.zoom_type == 1 and device.bas_alt_permitted(snapshot.section)) and true or false
+	present_laser(snapshot.id, visible, snapshot.section)
+	laser_owned = true
+	return visible
+end
+
+
+local function state_valid(state)
+	if not state or not player.actor(true) then return false end
+	local snapshot = player.active_weapon()
+	local _, device_id = device.nv_device()
+	if snapshot.id ~= state.weapon_id or snapshot.section ~= state.section or device_id ~= state.device_id then return false end
+	if classify(snapshot) ~= state.context then return false end
+	if player.presentation_blocked(snapshot, false) then return false end
+	if snapshot.is_weapon and snapshot.state ~= 0 then return false end
+	return true, snapshot
+end
+
+
+local function native_aim_cycle()
+	local action = key_bindings.kWPN_FUNC
+	local dik = api.action_dik(action)
+	if not dik then return false end
+	local _, ok = api.synthetic_cycle(dik, action, false)
+	return ok
+end
+
+
+local function perform_tap(state, snapshot)
+	if state.context == OUT_NV_OFF then return real_headlamp_toggle() end
+	if state.context == OUT_NV_ON then return device.adjust_nv_brightness() end
+	if state.context == PRIMARY then
+		if not player.alt_aim_supported(snapshot) then return false end
+		return native_aim_cycle()
+	end
+	if state.context == ALT_LASER or state.context == ALT_OTHER then return native_aim_cycle() end
+	return false
+end
+
+
+local function perform_hold(state, snapshot)
+	if state.context == OUT_NV_OFF then return device.toggle_nv(true) end
+	if state.context == OUT_NV_ON then return device.toggle_nv(false) end
+	-- cycle_mark itself only cycles a sight with at least two real reticles.
+	if state.context == PRIMARY then return device.cycle_mark(snapshot) end
+	if state.context == ALT_LASER then return device.cycle_laser_hue(snapshot) end
+	return false
+end
+
+
+local function cancel(reason)
+	if not gesture then return end
+	swallowed[gesture.dik] = true
+	gesture = nil
+	publish_gesture(false)
+	suppress_until = math.max(suppress_until, now() + 100)
+	log_info("L gesture cancelled | reason=%s", tostring(reason))
+end
+
+
+local function past_hold_threshold(state)
+	return now() - state.at >= api.get_setting("v2_contextual_equipment/hold_threshold_ms")
+end
+
+
+local function classify_hold(state)
+	if not state or state.classified or not past_hold_threshold(state) then return end
+	local valid, snapshot = state_valid(state)
+	if not valid then cancel("context-change") return end
+	state.classified = true
+	perform_hold(state, snapshot)
+end
+
+
+-- Takes the live gesture and ends it.  The gesture is cleared and the flag
+-- dropped before a tap runs, because torch_suppressed reads the gesture while
+-- the real headlamp toggles.
+local function finish()
+	local state = gesture
+	gesture = nil
+	publish_gesture(false)
+	local held = state.classified or past_hold_threshold(state)
+	local valid, snapshot = state_valid(state)
+	if valid and not held then perform_tap(state, snapshot) end
+	suppress_until = math.max(suppress_until, now() + 100)
+end
+
+
+-- Whether an L press is taken with this weapon in hand.
+local function claims(snapshot)
+	return not (player.presentation_blocked(snapshot, false) or (snapshot.is_weapon and snapshot.state ~= 0))
+end
+
+
+-- The press path, shared by a press read down and a deferred press run at its
+-- release: the context is captured here.
+local function press(dik)
+	if gesture then cancel("new-L") end
+	local snapshot = player.active_weapon()
+	if not claims(snapshot) then return false end
+	local _, device_id = device.nv_device()
+	gesture = {
+		dik = dik, at = now(), classified = false,
+		context = classify(snapshot), weapon_id = snapshot.id,
+		section = snapshot.section, device_id = device_id,
+	}
+	publish_gesture(true)
+	suppress_until = math.max(suppress_until, now() + 50)
+	wake()
+	return true
+end
+
+
+function init(core)
+	api = core or apb_v2_core
+end
+
+
+function on_option_change()
+	local wanted = api.get_setting("v2_contextual_equipment/enabled")
+	api.set_active(ID, wanted)
+	-- Every enabled pass re-runs both installs: each is a no-op once done, and
+	-- the BAS detach still has to happen for a BAS that was missing before.
+	if wanted then
+		enabled = true
+		install_torch_wrapper()
+		detach_bas_callbacks()
+	elseif enabled then
+		enabled = false
+		cancel("disabled")
+		restore_laser()
+		restore_torch_wrapper()
+		restore_bas_callbacks()
+		api.sleep(ID)
+	end
+end
+
+
+-- The core routes only the descriptor's observe binds here, so a verified
+-- press of any of them is another input that cancels the live gesture.
+function observe_input(input_phase, dik, bind, dis, ...)
+	if not enabled or dis or not gesture or input_phase ~= "press" then return end
+	if api.confirmed_down(dik) then cancel("new-input") end
+end
+
+
+-- The core routes only the descriptor's claim bind, kTORCH, here.  A press
+-- read as up is a tap whose release shares its input batch, or a script's
+-- press; one the module would take waits for that release
+-- (apb_v2_core.defer_press).
+function on_key_press(dik, bind, dis)
+	if not enabled or dis then return false end
+	if api.confirmed_down(dik) then return press(dik) end
+	if not claims(player.active_weapon()) then return false end
+	return api.defer_press(ID, dik, bind)
+end
+
+
+function on_key_hold(dik, bind, dis)
+	if swallowed[dik] then return true end
+	if gesture and gesture.dik == dik then
+		classify_hold(gesture)
+		return true
+	end
+	return false
+end
+
+
+function on_key_release(dik, bind, dis)
+	-- A deferred press runs now and ends below as a tap; one the module no
+	-- longer takes reaches the native chain ahead of its release.
+	if api.take_deferred_press(ID, dik) and not press(dik) then
+		api.synthetic_action("press", dik, bind, false)
+		return false
+	end
+	if swallowed[dik] then
+		swallowed[dik] = nil
+		suppress_until = math.max(suppress_until, now() + 100)
+		return true
+	end
+	if gesture and gesture.dik == dik then
+		finish()
+		wake()
+		return true
+	end
+	return false
+end
+
+
+function on_update(_)
+	if not enabled then return nil end
+	for dik, _ in pairs(swallowed) do
+		local down, known = api.hardware_down(dik)
+		if known and not down then swallowed[dik] = nil end
+	end
+	if gesture then
+		local down, known = api.hardware_down(gesture.dik)
+		if not known then
+			cancel("hardware-uncertain")
+		elseif not down then
+			finish()
+		else
+			classify_hold(gesture)
+		end
+	end
+	local laser_visible = reconcile_laser(player.active_weapon())
+	if gesture then return 0 end
+	if laser_visible then return 250 end
+	return nil
+end
+
+
+-- Only the events declared in MODULE.events arrive here; the HUD animation and
+-- first-update interests are wake-only routes handled by the core.  Every
+-- routed event other than load_complete is a weapon, slot or aim change that
+-- cancels a live gesture.
+function on_event(name, ...)
+	if not enabled then return end
+	if name == "load_complete" then
+		reset(name)
+	elseif gesture then
+		cancel(name)
+	end
+	wake()
+end
+
+
+-- Context gestures and temporary laser presentation are session-only; nothing
+-- is persisted, so there is no save hook.
+function reset(reason)
+	if gesture then swallowed[gesture.dik] = true end
+	gesture = nil
+	publish_gesture(false)
+	suppress_until = 0
+	restore_laser()
+end
+
+
+-- Read-only view of the live gesture. Nothing in the mod calls this (the
+-- visor reads api.flag("contextual_gesture")); it exists so the published
+-- flag can be checked against the gesture itself from outside the module.
+function is_gesture_active()
+	return gesture ~= nil
+end
+
+
+MODULE = {
+	id = ID,
+	priority = 900,
+	events = {
+		"actor_item_to_slot", "actor_item_to_ruck", "actor_on_changed_slot",
+		"actor_on_weapon_zoom_in", "actor_on_weapon_zoom_out", "actor_on_weapon_zoom_type_changed",
+		"actor_on_weapon_reload", "actor_on_weapon_jammed", "load_complete",
+	},
+	resets = { "actor_on_before_death", "actor_on_net_destroy", "on_before_level_changing", "on_level_changing" },
+	wake_only = { "actor_on_first_update", "actor_on_hud_animation_play", "actor_on_hud_animation_end" },
+	input = {
+		observe = {
+			"kWPN_FIRE", "kWPN_ZOOM", "kWPN_RELOAD", "kWPN_FUNC", "kSAFEMODE",
+			"kNIGHT_VISION", "kCROUCH", "kJUMP", "kSPRINT_TOGGLE",
+		},
+		claim = { "kTORCH" },
+	},
+	handlers = {
+		init = init, option_change = on_option_change, update = on_update, event = on_event, reset = reset,
+		key_press = on_key_press, key_hold = on_key_hold, key_release = on_key_release, observe = observe_input,
+	},
+}

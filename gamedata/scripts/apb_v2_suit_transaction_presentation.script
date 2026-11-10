@@ -1,0 +1,174 @@
+-- Advanced Player Behavior v2: Suit Setups presentation partial.
+--
+-- install(Service, C) attaches every optional-presentation method of the
+-- switch service to the Service class owned by apb_v2_suit_transaction.  This
+-- is the only Suit file that names the optional presentation providers: the
+-- FDDA MCM/outfit/headgear/plate tables, itms_manager, actor_effects,
+-- level.remove_pp_effector and the headgear blacklist ltx, and it holds the
+-- three FDDA headgear safeguards (NVG exclusions, blacklist, fade).  Every
+-- provider is absent-tolerant: a missing one degrades to truthful equipment
+-- moves plus partial-presentation reporting.  Bodies are verbatim, so `self`
+-- is still the service; C carries the mode constants the transaction owns.
+
+local headgear_nvg_blacklist = {
+	["helm_bandana"] = true,
+	["helm_rp_bala"] = true,
+	["helm_resp"] = true,
+	["helm_cloth_mask"] = true,
+}
+
+function install(Service, C)
+	local FORWARD = C.FORWARD
+
+	function Service:fdda_animation_enabled(path)
+		local cached = self.fdda_config_cache[path]
+		if cached ~= nil then return cached end
+		local api = liz_fdda_redone_mcm
+		if not (api and api.get_config) then
+			self.fdda_config_cache[path] = false
+			return false
+		end
+		local ok, enabled = pcall(api.get_config, path)
+		local result = ok and (enabled == true or enabled == 1 or enabled == "1")
+		self.fdda_config_cache[path] = result and true or false
+		return self.fdda_config_cache[path]
+	end
+
+	function Service:cleanup_headgear(tx)
+		if not (tx and tx.headgear_queue_started) then
+			return
+		end
+		tx.headgear_queue_started = false
+		pcall(function() level.remove_pp_effector(4277) end)
+		local effects = actor_effects
+		if effects then
+			pcall(function()
+				effects.helm_off = false
+				if effects.Update_Mask and self:actor() then
+					effects.Update_Mask(self:actor())
+				end
+			end)
+		end
+	end
+
+	function Service:play_belt_item_sound(item)
+		local manager = itms_manager
+		if not (item and manager and manager.play_item_sound) then
+			self:warn("belt item sound API or item was unavailable")
+			return false
+		end
+		local ok, err = pcall(manager.play_item_sound, item)
+		if not ok then self:warn("belt item sound failed: %s", tostring(err)) end
+		return ok
+	end
+
+	function Service:helmet_is_blacklisted(section)
+		if self.headgear_blacklist == nil then
+			local ok, blacklist = pcall(ini_file, "items\\items\\headgear_blacklist.ltx")
+			self.headgear_blacklist = ok and blacklist or false
+		end
+		if self.headgear_blacklist == false then
+			if not self.headgear_blacklist_warned then
+				self.headgear_blacklist_warned = true
+				self:warn("headgear blacklist unavailable; mask/equip presentation skipped")
+			end
+			return true
+		end
+		return self.headgear_blacklist:section_exist(section) and true or false
+	end
+
+	-- FDDA's own NVG exclusions: these helmets get no night-vision action.
+	function Service:helmet_skips_nvg(section)
+		return headgear_nvg_blacklist[section] == true
+	end
+
+	function Service:helmet_uses_fade(section)
+		local api = liz_fdda_redone_headgear_animations
+		if not (api and api.is_use_fade) then
+			return false
+		end
+		local ok, result = pcall(api.is_use_fade, section)
+		return ok and result or false
+	end
+
+	function Service:is_animated_belt_item(item)
+		local api = liz_fdda_redone_armor_plate
+		if not (api and api.predicate) then
+			return false
+		end
+		local ok, result = pcall(api.predicate, item, "actor_equ")
+		return ok and result and true or false
+	end
+
+	function Service:make_belt_animation(tx, ref, mode)
+		local item = self.equipment.resolve_belt_ref(ref, self:actor())
+		if not item or not self:is_animated_belt_item(item) then
+			return nil
+		end
+		if not self:fdda_animation_enabled("outfit_anm/enable_plate_equip") then
+			return nil
+		end
+		local api = liz_fdda_redone_armor_plate
+		if not (api and api.ta_animation) then
+			self:mark_partial(tx, "animation", "armor plate animation API was unavailable")
+			return nil
+		end
+
+		local equip = mode == "equip"
+		local label = equip and "belt plate equip" or "belt plate unequip"
+		local animation = tx.queue:try_native_action(
+			label,
+			api.ta_animation,
+			equip and "plate_add" or "plate_remove",
+			item,
+			equip and "actor_bag" or "actor_equ",
+			equip and "equip" or "unequip"
+		)
+		if animation then
+			animation.on_exit = nil
+			animation.name = equip and "gss_plate_add_animation" or "gss_plate_remove_animation"
+		end
+		return animation
+	end
+
+	-- Queued only after the suit actually changed.
+	function Service:enqueue_outfit_animation(tx)
+		self:enqueue_direct(tx, "gss_outfit_animation_dispatch", function()
+			if tx.fatal_reason then
+				return
+			end
+			if not self:fdda_animation_enabled("outfit_anm/enable_outfit_equip") then
+				self:trace("slot %d outfit animation disabled in FDDA", tx.index)
+				return
+			end
+
+			local api = liz_fdda_redone_outfit
+			local actor = self:actor()
+			local target = actor and actor:item_in_slot(7) or nil
+			if not (api and api.ta_animation_equip and target and self:slot_matches(7, tx.setup.suit)) then
+				self:mark_partial(tx, "animation", "outfit animation API or equipped target was unavailable")
+				return
+			end
+
+			local section = "outfit_animation_hud"
+			if api.select_animation then
+				local ok, selected = pcall(api.select_animation, target:section())
+				if ok and selected then
+					section = selected
+				end
+			end
+			local animation = tx.queue:try_native_action("outfit equip", api.ta_animation_equip, section)
+			if animation then
+				self:trace("slot %d queued FDDA outfit animation", tx.index)
+				tx.queue:enqueue_first(animation)
+			end
+		end, FORWARD)
+	end
+
+	-- The single place that names the FDDA headgear animation table.  The
+	-- forward helmet sequence asks for it here, so the optional presentation
+	-- providers stay confined to this partial.
+	function Service:headgear_api()
+		return liz_fdda_redone_headgear_animations
+	end
+end

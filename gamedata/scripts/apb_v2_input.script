@@ -1,0 +1,144 @@
+-- Advanced Player Behavior v2: the single late, composable input arbiter.
+
+local api = apb_v2_core
+local installed = false
+local original = {}
+
+
+local function log_error(fmt, ...)
+	api.log_error("INPUT", fmt, ...)
+end
+
+
+local function pass(phase, ...)
+	local fn = original[phase]
+	if type(fn) ~= "function" then return false end
+	return fn(...)
+end
+
+
+local function dispatch(phase, dik, bind, dis, ...)
+	-- Synthetic native edges re-enter this wrapper. They must traverse the
+	-- captured chain exactly once and must never be classified as hardware.
+	if api.is_synthetic() or dis then
+		return pass(phase, dik, bind, dis, ...)
+	end
+	-- Hardware press/release edges are the only timestamps that feed hold
+	-- classification, so they retire the frame clock sample and the first
+	-- reader times them exactly; per-frame hold edges read the sample
+	-- update() already took.
+	if phase ~= "hold" then api.invalidate_epoch() end
+	-- The captured level_input chain owns on_before_key_* blockers. It performs
+	-- no native action itself: the engine acts only after this outer handler
+	-- returns false. Give existing wrappers the first and only opportunity to
+	-- consume the physical edge, then let APB classify an unconsumed gesture.
+	local upstream = pass(phase, dik, bind, dis, ...)
+	if upstream then
+		-- Observers never claim input. They still need the physical edge so Aim,
+		-- Fire, movement, and UI blockers can cancel APB-owned work even when an
+		-- earlier wrapper legitimately consumes the action itself.
+		api.observe_input(phase, dik, bind, dis, ...)
+		return upstream
+	end
+	local handled, result = api.dispatch_input(phase, dik, bind, dis, ...)
+	return handled and (result == nil and true or result) or upstream
+end
+
+
+local function wrapped_press(dik, bind, dis, ...)
+	return dispatch("press", dik, bind, dis, ...)
+end
+
+
+local function wrapped_hold(dik, bind, dis, ...)
+	return dispatch("hold", dik, bind, dis, ...)
+end
+
+
+local function wrapped_release(dik, bind, dis, ...)
+	return dispatch("release", dik, bind, dis, ...)
+end
+
+
+local function raw_key_press(dik)
+	api.invalidate_epoch()
+	api.dispatch_raw_key(dik)
+end
+
+
+-- The engine has no call that sets the actor's stance.  Prone is its Crouch
+-- and Walk movement flags, and with the toggles off only a key hold sets them,
+-- so stance has to send the Walk action.  level.hold_action takes a key code,
+-- which makes that the player's Walk key (Left Shift by default), and scripts
+-- that track Shift from on_key_press and on_key_hold would read it as held
+-- for as long as the player is prone: ui_inventory then refuses to open a loot
+-- window.  The actor receives the edge after these forwarders, so dropping
+-- APB's own Walk edge here hides it from scripts only.  An edge sent while the
+-- Walk key is physically down is left alone, because the player really is
+-- holding it, and releases are not touched because listeners only clear a
+-- flag on them.
+local function hide_synthetic_walk(name)
+	local forward = bind_stalker_ext and bind_stalker_ext[name]
+	if type(forward) ~= "function" then return end
+	bind_stalker_ext[name] = function(binder, key, ...)
+		if api.synthetic_bind() == key_bindings.kACCEL and not api.confirmed_down(key) then return end
+		return forward(binder, key, ...)
+	end
+end
+
+
+-- Installation is all-or-nothing: the composition root aborts when it fails,
+-- and nothing retries it later in the session.  Only this script's own
+-- installed flag means "installed": a router marker it did not write belongs
+-- to another copy of the arbiter (a stale duplicate script), and reporting
+-- success on that marker would leave APB with no input chain and no raw-key
+-- callback, so it is refused instead of wrapping level_input a second time.
+local function install()
+	if installed then return true end
+	if not (level_input and type(level_input.on_key_press) == "function" and
+		type(level_input.on_key_hold) == "function" and
+		type(level_input.on_key_release) == "function") then
+		log_error("level_input press/hold/release surface is unavailable")
+		return false
+	end
+	local marker = level_input.__advanced_player_behavior_v2_router
+	if marker then
+		log_error("level_input already carries an APB router marker (%s) that this arbiter did not set; " ..
+			"another copy of the arbiter is loaded, so level_input is not wrapped twice", tostring(marker))
+		return false
+	end
+	if not (level and type(level.press_action) == "function" and
+		type(level.hold_action) == "function" and type(level.release_action) == "function" and
+		type(level.actor_moving_state) == "function" and type(key_state) == "function" and
+		type(bind_to_dik) == "function") then
+		log_error("required Modded Exes input/action APIs are unavailable")
+		return false
+	end
+
+	original.press = level_input.on_key_press
+	original.hold = level_input.on_key_hold
+	original.release = level_input.on_key_release
+	level_input.on_key_press = wrapped_press
+	level_input.on_key_hold = wrapped_hold
+	level_input.on_key_release = wrapped_release
+	level_input.__advanced_player_behavior_v2_router = api.BUILD
+
+	-- One-argument closures: synthetic_action forwards (dik, bind, dis, ...)
+	-- and the extra arguments must not reach the Luabind call.
+	api.set_input_chain({
+		press = function(dik) return level.press_action(dik) end,
+		hold = function(dik) return level.hold_action(dik) end,
+		release = function(dik) return level.release_action(dik) end,
+	})
+	hide_synthetic_walk("on_key_press")
+	hide_synthetic_walk("on_key_hold")
+	RegisterScriptCallback("on_key_press", raw_key_press)
+	installed = true
+	return true
+end
+
+
+function init(core)
+	api = core or apb_v2_core
+	return install()
+end

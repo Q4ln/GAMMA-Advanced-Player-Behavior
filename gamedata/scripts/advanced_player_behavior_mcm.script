@@ -1,0 +1,76 @@
+-- MCM page for the clean APB v2 runtime.
+--
+-- The tree is derived from the core's SETTINGS descriptor (settings_spec()):
+-- section id = key prefix, control id = key suffix, control type, default and
+-- range from the record.  Only the section titles and the one descriptive
+-- note are spelled here.
+
+local core = apb_v2_core
+local ROOT = core.ROOT
+
+local SECTION_TEXT = {
+	v2_stance_controls = "ui_apb_mcm_stance_controls",
+	v2_weapon_readiness = "ui_apb_mcm_weapon_readiness",
+	v2_smart_visor_wiping = "ui_apb_mcm_smart_visor_wiping",
+	v2_contextual_equipment = "ui_apb_mcm_contextual_equipment",
+	v2_unscoped_free_zoom = "ui_apb_mcm_unscoped_free_zoom",
+	v2_suit_setups = "ui_apb_mcm_suit_setups",
+}
+
+-- Descriptive text appended after a section's derived controls.
+local SECTION_NOTE = {
+	v2_suit_setups = { id = "manager_note", text = "ui_apb_mcm_suit_setups_manager_note" },
+}
+
+
+local function title()
+	return {
+		id = "title",
+		type = "slide",
+		link = "ui_options_slider_player",
+		text = "ui_mcm_menu_advanced_player_behavior",
+		size = { 512, 50 },
+		spacing = 20,
+	}
+end
+
+
+local function control(id, record)
+	if record.kind == "track" then
+		return { id = id, type = "track", val = 2, min = record.min, max = record.max, step = record.step, def = record.def }
+	end
+	return { id = id, type = record.kind, val = record.kind == "check" and 1 or 2, def = record.def }
+end
+
+
+local function sections()
+	local list = {}
+	local by_prefix = {}
+	local spec = core.settings_spec()
+	for index = 1, #spec do
+		local record = spec[index]
+		local prefix, suffix = string.match(record.key, "^([^/]+)/(.+)$")
+		local section = by_prefix[prefix]
+		if not section then
+			section = { id = prefix, text = SECTION_TEXT[prefix], sh = true, gr = { title() } }
+			by_prefix[prefix] = section
+			list[#list + 1] = section
+		end
+		section.gr[#section.gr + 1] = control(suffix, record)
+	end
+	for index = 1, #list do
+		local note = SECTION_NOTE[list[index].id]
+		if note then
+			list[index].gr[#list[index].gr + 1] = { id = note.id, type = "desc", text = note.text }
+		end
+	end
+	return list
+end
+
+
+function on_mcm_load()
+	return {
+		id = ROOT,
+		gr = sections(),
+	}
+end

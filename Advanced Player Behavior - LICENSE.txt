@@ -1,0 +1,11 @@
+Advanced Player Behavior
+Copyright (c) 2026 Q4ln
+
+The original code and assets of this mod are by Q4ln and are licensed under
+the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+licence (CC BY-NC-SA 4.0):
+https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+Third-party mods that this mod integrates with, and any third-party assets it
+uses or ships, are not covered by this licence and remain under their own
+authors' terms.

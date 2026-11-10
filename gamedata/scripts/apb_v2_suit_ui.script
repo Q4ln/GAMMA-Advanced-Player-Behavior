@@ -1,0 +1,71 @@
+-- Advanced Player Behavior v2: shared Suit Setups presentation.
+--
+-- The manager rows and the wheel options render the same slot, so the status
+-- palette and the manual utils_ui item cell live here once, with the
+-- translated status word the wheel's title shows (the manager's rows show
+-- none; their names carry the colour). This module owns no engine callbacks,
+-- no dialog and no APB dependency: both UIs read their rows from
+-- remember_outfit_belt and hand the row's status and suit fields straight to
+-- the helpers below.
+--
+-- The keys of STATUS_COLOR are the STATUS_* values of the suit registry,
+-- re-exported by remember_outfit_belt; the two sets must stay identical.
+
+-- Status word colours from GAMMA's ui/color_defs.xml palette.
+STATUS_COLOR = {
+	["empty"] = GetARGB(255, 128, 128, 128), -- ui_gray
+	["equipped"] = GetARGB(255, 56, 166, 209), -- pda_blue
+	["unavailable"] = GetARGB(255, 238, 28, 36), -- pda_red
+	["partial"] = GetARGB(255, 209, 209, 56), -- pda_yellow
+	["ready"] = GetARGB(255, 56, 209, 115), -- pda_green
+}
+
+-- Five possible statuses and a localisation that cannot change without a
+-- restart, so the translated word is looked up once per status per session.
+local status_texts = {}
+
+function status_text(status)
+	local text = status_texts[status]
+	if not text then
+		text = game.translate_string("ui_apb_v2_suit_status_" .. status)
+		status_texts[status] = text
+	end
+	return text
+end
+
+-- One empty manual utils_ui cell for a suit icon, built like Haru's
+-- ItemWheelOption; `grid_size` is the utils_ui grid unit of the caller's box.
+function new_suit_cell(id, owner, path, parent, grid_size)
+	local icon = utils_ui.UICellContainer(id, owner, path, path, parent, true)
+	icon.disable_drag = true
+	icon.disable_info = true
+	icon.disable_bar = true
+	icon.grid_size = grid_size
+	icon:AddItemManual(nil, nil, 1)
+	return icon
+end
+
+-- Manual utils_ui cells keep their XML size, so after every Set the cell is
+-- matched to the icon and centred in its box (haru ResizeAndCenterCell).
+function show_suit(icon, obj, section)
+	local cell = icon.cell[1]
+	cell.showcase = obj and 0 or 1
+	if not icon:AddItemManual(obj, section, 1) then return end
+	cell.cell:SetWndSize(vector2():set(cell.W * utils_xml.screen_ratio(), cell.H))
+	cell.cell:SetWndPos(vector2():set(
+		(icon.prof:GetWidth() - cell.cell:GetWidth()) * 0.5,
+		(icon.prof:GetHeight() - cell.cell:GetHeight()) * 0.5))
+	icon:AddItemManual(obj, section, 1)
+	cell:Colorize(obj and "def" or "hide")
+end
+
+-- GAMMA draws a suit's armour-class tag, faction patch and part dots at their
+-- inventory size whatever the cell's grid, so on these smaller icons they
+-- overhang the picture and get cut; only the suit itself is shown.
+function hide_badges(icon)
+	local cell = icon.cell[1]
+	for _, key in ipairs({"layer", "property_layer", "parts_indicators"}) do
+		for _, widget in pairs(cell[key] or {}) do widget:Show(false) end
+	end
+	if cell.upgr then cell.upgr:Show(false) end
+end

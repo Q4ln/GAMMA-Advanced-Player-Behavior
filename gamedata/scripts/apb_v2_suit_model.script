@@ -1,0 +1,169 @@
+-- Advanced Player Behavior v2: Suit Setups registry and data policy.
+-- This module owns only the detached eight-slot registry. Engine callbacks and
+-- save-bucket persistence are owned by remember_outfit_belt.script, which also
+-- owns the busy guard: writing here while a transaction is live is refused by
+-- the facade, so the registry knows nothing about the transaction.
+--
+-- apb_v2_suit_equipment is resolved at call time: it loads after this file.
+
+SLOT_COUNT = 8
+SCHEMA = 1
+local NAME_LIMIT = 10
+local MAX_BELT_REFS = 64
+
+STATUS_EMPTY = "empty"
+STATUS_EQUIPPED = "equipped"
+STATUS_UNAVAILABLE = "unavailable"
+STATUS_PARTIAL = "partial"
+STATUS_READY = "ready"
+
+local slots = {}
+
+-- The game's edit box and fonts use a single-byte code page (CP1251 for
+-- Russian), so one byte is one character and every byte is kept.
+local function name_prefix(text)
+	return string.sub(text, 1, NAME_LIMIT)
+end
+
+function sanitize_name_live(value)
+	local text = string.gsub(tostring(value or ""), "[%c]", "")
+	return name_prefix(text)
+end
+
+function sanitize_name(value, slot)
+	local text = string.gsub(tostring(value or ""), "[%c]", "")
+	text = string.gsub(text, "^%s+", "")
+	text = string.gsub(text, "%s+$", "")
+	local name = name_prefix(text)
+	name = string.gsub(name, "%s+$", "")
+	return name ~= "" and name or tostring(slot)
+end
+
+function valid_slot(index)
+	return type(index) == "number"
+		and index >= 1 and index <= SLOT_COUNT
+		and math.floor(index) == index
+end
+
+function is_actionable(status)
+	return status == STATUS_READY or status == STATUS_PARTIAL
+end
+
+function sanitize_ref(value)
+	if type(value) ~= "table" then return nil end
+	local object_id = tonumber(value.object_id)
+	local section = value.section
+	if not object_id or object_id ~= object_id
+		or object_id == math.huge or object_id == -math.huge
+		or object_id < 0 or object_id >= 65535
+		or math.floor(object_id) ~= object_id
+		or type(section) ~= "string" or section == ""
+	then
+		return nil
+	end
+	return {object_id = object_id, section = section}
+end
+
+-- Always returns a fresh, detached table (or nil); readers rely on this
+-- copy-on-read so no caller can mutate the registry.
+function sanitize_setup(value, slot)
+	if type(value) ~= "table" then return nil end
+	local suit = sanitize_ref(value.suit)
+	if not suit then return nil end
+
+	local result = {
+		name = sanitize_name(value.name, slot),
+		suit = suit,
+		helmet = sanitize_ref(value.helmet),
+		belt = {},
+	}
+	local seen = {}
+	if type(value.belt) == "table" then
+		for _, raw in ipairs(value.belt) do
+			if #result.belt >= MAX_BELT_REFS then break end
+			local ref = sanitize_ref(raw)
+			if ref then
+				local key = apb_v2_suit_equipment.ref_key(ref)
+				if not seen[key] then
+					seen[key] = true
+					result.belt[#result.belt + 1] = ref
+				end
+			end
+		end
+	end
+	return result
+end
+
+function get_slot(slot)
+	if not valid_slot(slot) or not slots[slot] then return nil end
+	return sanitize_setup(slots[slot], slot)
+end
+
+function snapshot_slots()
+	local result = {}
+	for slot = 1, SLOT_COUNT do
+		if slots[slot] then result[slot] = sanitize_setup(slots[slot], slot) end
+	end
+	return result
+end
+
+local function capture(slot, name)
+	local raw, reason = apb_v2_suit_equipment.capture_setup()
+	if not raw then return nil, reason or "no_suit" end
+	raw.name = sanitize_name(name, slot)
+	local setup = sanitize_setup(raw, slot)
+	return setup, setup and nil or "invalid_capture"
+end
+
+function save_slot(slot, name)
+	if not valid_slot(slot) or slots[slot] then
+		return false, "invalid_slot"
+	end
+	local setup, reason = capture(slot, name)
+	if not setup then return false, reason end
+	slots[slot] = setup
+	return true
+end
+
+function overwrite_slot(slot)
+	if not valid_slot(slot) or not slots[slot] then
+		return false, "invalid_slot"
+	end
+	local setup, reason = capture(slot, slots[slot].name)
+	if not setup then return false, reason end
+	slots[slot] = setup
+	return true
+end
+
+function rename_slot(slot, name)
+	if not valid_slot(slot) or not slots[slot] then
+		return false, "invalid_slot"
+	end
+	slots[slot].name = sanitize_name(name, slot)
+	return true
+end
+
+function delete_slot(slot)
+	if not valid_slot(slot) or not slots[slot] then
+		return false, "invalid_slot"
+	end
+	slots[slot] = nil
+	return true
+end
+
+function export_bucket()
+	return {schema = SCHEMA, slots = snapshot_slots()}
+end
+
+function import_bucket(bucket)
+	slots = {}
+	if type(bucket) ~= "table" or bucket.schema ~= SCHEMA
+		or type(bucket.slots) ~= "table"
+	then
+		return false
+	end
+	for slot = 1, SLOT_COUNT do
+		slots[slot] = sanitize_setup(bucket.slots[slot], slot)
+	end
+	return true
+end

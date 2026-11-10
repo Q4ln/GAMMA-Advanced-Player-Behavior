@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<w>
+	<!-- Body, header strip and list outline are the art of GAMMA's own item
+	     details and save windows, so the panel is opaque over the inventory. -->
+	<form x="400" y="126" width="224" height="501" stretch="1">
+		<background x="0" y="0" width="224" height="501" stretch="1">
+			<texture>ui_inGame2_item_2_background</texture>
+		</background>
+
+		<title x="12" y="23" width="200" height="26">
+			<text font="letterica18" r="200" g="200" b="200" align="c" vert_align="c">ui_apb_v2_suit_title</text>
+		</title>
+
+		<list_frame x="12" y="60" width="200" height="358">
+			<texture>ui_inGame2_servers_list_frame</texture>
+		</list_frame>
+
+		<!-- The inventory's own toggle wash, moved behind the selected row by the manager. -->
+		<selection_frame x="14" y="63" width="196" height="44" stretch="1">
+			<texture>ui_button_inv_t</texture>
+		</selection_frame>
+
+		<!-- Instantiated eight times and vertically positioned by the manager. -->
+		<row_template x="14" y="63" width="196" height="44" stretch="1">
+			<!-- utils_ui.UICellContainer manual cell; shape from ui_haru_wheel_option.xml. -->
+			<cont_item x="2" y="-2" width="48" height="48" stretch="1">
+				<st width="48" height="48" stretch="1"/>
+				<scroll width="48" height="48" stretch="1" right_ident="0" left_ident="0" top_indent="0" bottom_indent="0" vert_interval="0" always_show_scroll="0"/>
+
+				<cell stretch="1">
+					<upgrade x="0" y="0" width="10" height="12" stretch="1">
+						<texture a="180">ui_upgrade_arrow2</texture>
+					</upgrade>
+					<cnt x="-2" y="-1" width="21" height="11" stretch="1">
+						<texture a="200">ui_item_count_back</texture>
+						<text x="0" y="0" width="21" height="11" font="arial_14" color="ui_2" align="c" vert_align="c"/>
+					</cnt>
+					<highlight stretch="1">
+						<texture>ui_button_inv_h</texture>
+					</highlight>
+					<pic stretch="1" align="c" alignment="c"/>
+				</cell>
+
+				<cell_1 x="0" y="0" width="41" height="41" stretch="1">
+					<pic stretch="1" align="c" alignment="c"/>
+					<highlight stretch="1">
+						<texture>ui_inGame2_detector_highlighter</texture>
+					</highlight>
+					<bar x="0" y="0" width="25" height="3" horz="1" min="0" max="1" pos="1" stretch="1">
+						<background width="27" height="3" stretch="1">
+							<texture r="62" g="74" b="74">ui_inGame2_inventory_item_status_bar</texture>
+						</background>
+						<progress stretch="1">
+							<texture r="142" g="149" b="149">ui_inGame2_inventory_item_status_bar</texture>
+						</progress>
+					</bar>
+				</cell_1>
+			</cont_item>
+
+			<!-- Text sits a few units low: these fonts render above their box centre.
+			     The manager fits the width to the name and colours it by status. -->
+			<name x="54" y="4" width="136" height="40">
+				<text font="letterica18" r="200" g="200" b="200" align="l" vert_align="c"/>
+			</name>
+			<!-- The inventory cell's three-state wash: clear at rest, lit on hover. -->
+			<button x="0" y="0" width="196" height="44" stretch="1" check_mode="0">
+				<texture>ui_button_inv</texture>
+			</button>
+		</row_template>
+
+		<!-- Save also overwrites a saved row, after asking. -->
+		<btn_save x="12" y="426" width="98" height="28" stretch="1" check_mode="0">
+			<texture>ui_button_ordinary</texture>
+			<text font="letterica18" align="c" vert_align="c">ui_apb_v2_suit_save</text>
+		</btn_save>
+		<btn_apply x="114" y="426" width="98" height="28" stretch="1" check_mode="0">
+			<texture>ui_button_ordinary</texture>
+			<text font="letterica18" align="c" vert_align="c">ui_apb_v2_suit_apply</text>
+		</btn_apply>
+
+		<btn_delete x="12" y="458" width="98" height="28" stretch="1" check_mode="0">
+			<texture>ui_button_ordinary</texture>
+			<text font="letterica18" align="c" vert_align="c">ui_apb_v2_suit_delete</text>
+		</btn_delete>
+		<btn_close x="114" y="458" width="98" height="28" stretch="1" check_mode="0">
+			<texture>ui_button_ordinary</texture>
+			<text font="letterica18" align="c" vert_align="c">ui_apb_v2_suit_close</text>
+		</btn_close>
+
+		<!-- Laid out like the game's stash rename box (ui_items_backpack_16.xml). -->
+		<!-- As wide as the list, so the rows beside it are covered too. -->
+		<name_editor x="12" y="186" width="200" height="130" stretch="1">
+			<background x="0" y="0" width="200" height="130" stretch="1">
+				<texture>ui_inGame2_message_box</texture>
+			</background>
+			<caption x="10" y="12" width="180" height="24">
+				<text font="letterica18" r="200" g="200" b="200" align="c" vert_align="c">ui_apb_v2_suit_name</text>
+			</caption>
+			<input x="16" y="46" width="168" height="30" stretch="1">
+				<text x="5" font="letterica16" align="l" vert_align="c"/>
+				<texture>ui_inGame2_edit_box_2</texture>
+			</input>
+			<btn_accept x="16" y="90" width="80" height="28" stretch="1" check_mode="0">
+				<texture>ui_button_ordinary</texture>
+				<text font="letterica18" align="c" vert_align="c">ui_apb_v2_suit_accept</text>
+			</btn_accept>
+			<btn_cancel x="104" y="90" width="80" height="28" stretch="1" check_mode="0">
+				<texture>ui_button_ordinary</texture>
+				<text font="letterica18" align="c" vert_align="c">ui_apb_v2_suit_cancel</text>
+			</btn_cancel>
+		</name_editor>
+	</form>
+</w>

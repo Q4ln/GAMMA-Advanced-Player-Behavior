@@ -1,0 +1,1290 @@
+-- Advanced Player Behavior v2 shared runtime.
+--
+-- This file deliberately contains no gameplay policy.  It provides module
+-- registration from an explicit MODULE descriptor, an event dispatcher with
+-- event / reset / wake-only routes, bind- and DIK-indexed input dispatch, a
+-- deadline scheduler with a frame-epoch clock and a mutation epoch for the
+-- adapters' caches, cached versioned settings from
+-- one SETTINGS descriptor, a console-variable ownership registry, a shared
+-- action-down registry, a published-flag channel, guarded access to engine
+-- APIs, the synthetic-action input seam (set_input_chain plus
+-- synthetic_action) through which APB modules re-enter the captured
+-- level_input chain exactly once, and the deferred-press record that holds a
+-- press read as up until its release.
+--
+-- register(spec, namespace) is the only registration entry: every module
+-- exports one MODULE descriptor whose handlers are function values, so the
+-- core never probes a namespace by name.
+
+BUILD = "d2026.11.10.4"
+ROOT = "advanced_player_behavior"
+SAVE_ROOT = "advanced_player_behavior_v2"
+SAVE_SCHEMA = 1
+
+local TAG = "[ADVANCED-PLAYER-BEHAVIOR]"
+
+-- Single source of truth for setting keys, kinds, defaults and bounds.  The
+-- MCM page derives its tree from this list (settings_spec()); refresh_settings
+-- clamps every track to { min, max } and normalises every check to a boolean.
+-- Order is the MCM section/control order.
+local SETTINGS = {
+	{ key = "v2_stance_controls/enabled", kind = "check", def = true },
+	{ key = "v2_stance_controls/hold_threshold_ms", kind = "track", def = 250, min = 150, max = 500, step = 10 },
+	{ key = "v2_weapon_readiness/enabled", kind = "check", def = true },
+	{ key = "v2_weapon_readiness/calm_delay_ms", kind = "track", def = 2000, min = 0, max = 10000, step = 100 },
+	{ key = "v2_smart_visor_wiping/enabled", kind = "check", def = true },
+	{ key = "v2_smart_visor_wiping/trigger_percent", kind = "track", def = 30, min = 10, max = 100, step = 5 },
+	{ key = "v2_smart_visor_wiping/rearm_percent", kind = "track", def = 10, min = 0, max = 40, step = 5 },
+	{ key = "v2_smart_visor_wiping/min_interval_seconds", kind = "track", def = 30, min = 5, max = 120, step = 5 },
+	{ key = "v2_contextual_equipment/enabled", kind = "check", def = true },
+	{ key = "v2_contextual_equipment/hold_threshold_ms", kind = "track", def = 350, min = 200, max = 600, step = 10 },
+	{ key = "v2_unscoped_free_zoom/enabled", kind = "check", def = true },
+	{ key = "v2_suit_setups/open_wheel", kind = "key_bind", def = -1 },
+}
+
+-- The defaults until the first refresh_settings.
+local settings = {}
+for index = 1, #SETTINGS do settings[SETTINGS[index].key] = SETTINGS[index].def end
+
+-- The handler slots a descriptor may declare.
+local HANDLER_SLOTS = {
+	init = true, option_change = true, update = true, event = true, reset = true,
+	save = true, load = true, key_press = true, key_hold = true, key_release = true,
+	observe = true, raw_key = true,
+}
+-- Input phase to handler slot: a table lookup, never a per-edge string
+-- build; an unknown phase dispatches nothing.
+local KEY_METHOD = { press = "key_press", hold = "key_hold", release = "key_release" }
+local CONSOLE_ID = "__console"
+
+-- Engine events after which any cached weapon, slot, upgrade or device fact
+-- may be stale.  dispatch_event bumps the mutation epoch (and with it the
+-- frame epoch) before routing one of these, so every module routed from one
+-- mutation event shares one adapter snapshot rebuild.  event_names() always
+-- lists them, subscribed or not, so the composition root routes them all.
+local MUTATION_EVENTS = {
+	actor_item_to_slot = true, actor_item_to_ruck = true, actor_on_changed_slot = true,
+	actor_on_weapon_zoom_in = true, actor_on_weapon_zoom_out = true,
+	actor_on_weapon_zoom_type_changed = true, actor_on_weapon_reload = true,
+	actor_on_weapon_jammed = true, actor_on_item_upgrade = true,
+}
+
+-- Mutation events that exist only when another script adds them to axr_main.
+-- actor_on_item_upgrade is created by aol_mp412_monkeypatches.script
+-- (axr_main.callback_add); without that script axr_main refuses the
+-- registration and prints "callback actor_on_item_upgrade doesn't exist!",
+-- so the route is listed only while the script is loaded.
+local MUTATION_EVENT_GUARDS = {
+	actor_on_item_upgrade = "aol_mp412_monkeypatches",
+}
+
+-- Engine events that describe the frame's weapon snapshot itself, and nothing
+-- longer-lived.  dispatch_event retires the frame epoch before routing one, so
+-- the handler reads the change it is being told about instead of the snapshot
+-- the last core.update() built -- an external raise out of an animation must
+-- not be answered from the busy state that animation left behind.  They are
+-- deliberately not MUTATION_EVENTS: a raise changes no weapon config, no
+-- installed upgrade and no Free Zoom verdict, so retiring those caches on
+-- every raise and lower would be pure churn.
+local FRAME_EVENTS = {
+	actor_on_weapon_raise = true, actor_on_weapon_lower = true,
+}
+
+-- Events the core raises itself: load_state dispatches load_complete after
+-- every module's load, and the engine has no such callback to register.
+local INTERNAL_EVENTS = { load_complete = true }
+
+-- Routes the composition root re-registers at the end of every option_change:
+-- axr_main re-stamps a re-registered handler with a fresh ascending index, so
+-- APB's wheel route runs after magnifier_switch's, which re-registers its own
+-- on each MCM change.
+local REASSERTED_ROUTES = { "on_mouse_wheel" }
+
+local entries = {}
+local module_order = {}
+local event_routes = {}
+local reset_routes = {}
+local wake_routes = {}
+local route_guards = {}
+local observe_by_bind = {}
+local claim_by_bind = {}
+local observe_by_dik = {}
+local claim_by_dik = {}
+local raw_by_dik = {}
+local observe_mark = 0
+local claim_mark = 0
+local schedule = {}
+local scheduler_next_due = nil
+local input_chain = nil
+local synthetic_depth = 0
+local current_synthetic_bind = nil
+local frame_now = 0
+local frame_valid = false
+local frame_epoch = 0
+local hardware_epoch = 0
+local mutation_count = 0
+local route_reasserter = nil
+local actor_memo_epoch = -1
+local actor_memo_object = nil
+local actor_memo_present = false
+local actor_memo_alive = nil
+local started = false
+local dik_cache = {}
+local tracked_binds = {}
+local flags = {}
+local flag_owner = {}
+local owned_console = {}
+local owned_console_order = {}
+local console_entry = nil
+
+
+local function format_message(fmt, ...)
+	local ok, message = pcall(string.format, tostring(fmt), ...)
+	return ok and message or tostring(fmt)
+end
+
+
+local function tag(scope)
+	if scope == nil or scope == "" then return TAG end
+	return string.sub(TAG, 1, -2) .. ":" .. tostring(scope) .. "]"
+end
+
+
+function log_info(scope, fmt, ...)
+	printf("%s %s", tag(scope), format_message(fmt, ...))
+end
+
+
+function log_error(scope, fmt, ...)
+	printe("%s", tag(scope) .. " !ERROR: " .. format_message(fmt, ...))
+end
+
+
+function safe_call(fn, ...)
+	if type(fn) ~= "function" then return nil, false end
+	local ok, a, b, c, d = pcall(fn, ...)
+	if not ok then return nil, false, a end
+	return a, true, b, c, d
+end
+
+
+-- Shared protected member fetch: Luabind userdata may raise on unknown
+-- members, and a per-call closure would allocate on every lookup.
+local function index_member(object, name)
+	return object[name]
+end
+
+
+function safe_method(object, name, ...)
+	if object == nil then return nil, false end
+	local ok, method = pcall(index_member, object, name)
+	if not ok or type(method) ~= "function" then return nil, false end
+	return safe_call(method, object, ...)
+end
+
+
+-- Shared by truthy() and console_bool(): GAMMA declares some flags as numeric
+-- or token console variables rather than booleans.  Returns nil when the value
+-- carries no boolean meaning, which is what lets console_bool tell an
+-- unrecognised value apart from a false one.
+local function normalize(value)
+	if type(value) == "boolean" then return value end
+	if type(value) == "number" then return value ~= 0 end
+	if type(value) == "string" then
+		local normalized = string.lower(value)
+		if normalized == "true" or normalized == "on" or normalized == "1" then return true end
+		if normalized == "false" or normalized == "off" or normalized == "0" then return false end
+	end
+	return nil
+end
+
+
+function truthy(value, fallback)
+	if value == nil then return fallback and true or false end
+	local parsed = normalize(value)
+	if parsed ~= nil then return parsed end
+	return value and true or false
+end
+
+
+function clamp(value, minimum, maximum)
+	value = tonumber(value) or minimum
+	if value < minimum then return minimum end
+	if value > maximum then return maximum end
+	return value
+end
+
+
+-- Frame-epoch clock.  update() samples once per frame while anything is
+-- scheduled; every other reader shares that sample through now_ms().  The
+-- epoch is invalidated (sample retired, counter bumped) by a frame with
+-- nothing scheduled, by hardware press/release and raw key edges in the input
+-- arbiter, and after a synthetic action: the next reader then takes one exact
+-- read, so gesture edges are timed exactly and an idle frame or an edge nobody
+-- times costs no engine call.  The sample is monotonic non-decreasing.
+--
+-- epoch() is the key of every per-frame memo (adapter snapshots, actor(),
+-- moving_state).  Besides the clock events above it also advances on world
+-- mutations (MUTATION_EVENTS, invalidate_mutations, reset routes, reset())
+-- without retiring the clock sample: a mutation is not a clock event.  The
+-- action-down prune is keyed on the hardware epoch, which only clock events
+-- advance, because hardware key state cannot change without an edge or a
+-- new frame.
+local function read_clock()
+	local value, ok = safe_call(time_continual)
+	if ok and type(value) == "number" then return value end
+	value, ok = safe_call(time_global)
+	return ok and tonumber(value) or nil
+end
+
+
+function sample_clock()
+	local value = read_clock()
+	if value ~= nil and value >= frame_now then frame_now = value end
+	frame_valid = true
+	frame_epoch = frame_epoch + 1
+	hardware_epoch = hardware_epoch + 1
+	return frame_now
+end
+
+
+function epoch()
+	return frame_epoch
+end
+
+
+function invalidate_epoch()
+	frame_valid = false
+	frame_epoch = frame_epoch + 1
+	hardware_epoch = hardware_epoch + 1
+end
+
+
+-- Mutation epoch: the key of every cache that outlives a frame (Free Zoom
+-- eligibility verdicts, BAS weapon configs).  Bumped by MUTATION_EVENTS, by
+-- option_change and by device writes through invalidate_mutations().
+function mutation_epoch()
+	return mutation_count
+end
+
+
+function invalidate_mutations()
+	mutation_count = mutation_count + 1
+	frame_epoch = frame_epoch + 1
+end
+
+
+function now_ms()
+	if frame_valid then return frame_now end
+	return sample_clock()
+end
+
+
+-- Memoised per frame epoch and actor identity: level.present() and alive()
+-- are read at most once per epoch; a nil verdict is cached like any other.
+function actor(require_alive)
+	local value = db and db.actor
+	if not value then return nil end
+	if actor_memo_epoch ~= frame_epoch or actor_memo_object ~= value then
+		actor_memo_epoch = frame_epoch
+		actor_memo_object = value
+		actor_memo_present = level.present() and true or false
+		actor_memo_alive = nil
+	end
+	if not actor_memo_present then return nil end
+	if require_alive then
+		if actor_memo_alive == nil then
+			local alive, ok = safe_method(value, "alive")
+			actor_memo_alive = (ok and alive) and true or false
+		end
+		if not actor_memo_alive then return nil end
+	end
+	return value
+end
+
+
+-- The id of any game object, not only the actor's: a guarded object:id()
+-- read, nil when it fails.
+function actor_id(object)
+	local value, ok = safe_method(object, "id")
+	return ok and tonumber(value) or nil
+end
+
+
+function hardware_down(dik)
+	if type(key_state) ~= "function" or dik == nil then return false, false end
+	local value, ok = safe_call(key_state, dik)
+	if not ok then return false, false end
+	if type(value) == "boolean" then return value, true end
+	return (tonumber(value) or 0) ~= 0, true
+end
+
+
+-- true only when key_state answered and reports the key down; an unknown
+-- state reads as up.
+function confirmed_down(dik)
+	local down, known = hardware_down(dik)
+	return known and down
+end
+
+
+-- Drops every tracked DIK whose hardware state is unknown or no longer down.
+function prune_unconfirmed_down(states)
+	for dik, _ in pairs(states) do
+		local down, known = hardware_down(dik)
+		if not known or not down then states[dik] = nil end
+	end
+end
+
+
+-- Action-to-DIK resolution is cached per action; the cache is cleared by
+-- option_change() and reset() (when GAMMA re-publishes bindings).  A caller's
+-- fallback is a live hardware DIK, never a binding, and is never cached.
+function action_dik(action, fallback)
+	if action == nil then return fallback end
+	local cached = dik_cache[action]
+	if cached ~= nil then return cached end
+	if type(bind_to_dik) == "function" then
+		local value, ok = safe_call(bind_to_dik, action)
+		value = ok and tonumber(value) or nil
+		if value and value ~= 0 then
+			dik_cache[action] = value
+			return value
+		end
+	end
+	return fallback
+end
+
+
+local function clear_dik_cache()
+	for action, _ in pairs(dik_cache) do dik_cache[action] = nil end
+end
+
+
+-- get_console_cmd kinds in probe order: get_bool, get_float, get_string.
+local CONSOLE_KINDS = { 1, 2, 0 }
+
+
+function console_bool(name)
+	-- Console methods are Luabind callables. On the target runtime they are not
+	-- reliably exposed as plain Lua functions when fetched indirectly, so the
+	-- generic safe_method() path can reject them; the stock get_console_cmd
+	-- wrapper is used instead. GAMMA declares some flags as numeric or token
+	-- console variables rather than booleans, so the value must be normalized.
+	for index = 1, #CONSOLE_KINDS do
+		local value, ok = safe_call(get_console_cmd, CONSOLE_KINDS[index], name)
+		if ok then
+			local parsed = normalize(value)
+			if parsed ~= nil then return parsed end
+		end
+	end
+	return nil
+end
+
+
+function console_execute(command)
+	local _, ok = safe_call(exec_console_cmd, command)
+	return ok
+end
+
+
+-- The ordered SETTINGS list itself: read-only for callers (the MCM page).
+function settings_spec()
+	return SETTINGS
+end
+
+
+local function mcm_get(path)
+	if not (ui_mcm and type(ui_mcm.get) == "function") then return nil end
+	local value, ok = safe_call(ui_mcm.get, path)
+	if not ok then return nil end
+	return value
+end
+
+
+local function mcm_set(path, value)
+	if not (ui_mcm and type(ui_mcm.set) == "function") then return false end
+	local _, ok = safe_call(ui_mcm.set, path, value)
+	return ok
+end
+
+
+function get_setting(key)
+	return settings[key]
+end
+
+
+local function refresh_settings()
+	for index = 1, #SETTINGS do
+		local record = SETTINGS[index]
+		local value = mcm_get(ROOT .. "/" .. record.key)
+		if value == nil then value = record.def end
+		if record.kind == "track" then
+			value = clamp(value, record.min, record.max)
+		elseif record.kind == "check" then
+			value = truthy(value)
+		end
+		settings[record.key] = value
+	end
+
+	local trigger = settings["v2_smart_visor_wiping/trigger_percent"]
+	local rearm = settings["v2_smart_visor_wiping/rearm_percent"]
+	local normalized = math.max(0, math.min(rearm, trigger - 5))
+	settings["v2_smart_visor_wiping/rearm_percent"] = normalized
+	if normalized ~= rearm then
+		mcm_set(ROOT .. "/v2_smart_visor_wiping/rearm_percent", normalized)
+		log_info("VISOR", "normalized re-arm setting from %s to %s", tostring(rearm), tostring(normalized))
+	end
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Published facts
+
+function set_flag(id, name, value)
+	if name == nil then return false end
+	flags[name] = value
+	flag_owner[name] = value ~= nil and id or nil
+	return true
+end
+
+
+function flag(name)
+	return flags[name]
+end
+
+
+local function clear_flags(id)
+	for name, owner in pairs(flag_owner) do
+		if id == nil or owner == id then
+			flags[name] = nil
+			flag_owner[name] = nil
+		end
+	end
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Module registry
+
+local function compare(left, right)
+	if left.priority == right.priority then return left.id < right.id end
+	return left.priority > right.priority
+end
+
+
+-- A raising handler is isolated and reported, but a handler that keeps
+-- raising the same error (an update, or an event that fires every frame) is
+-- reported once: entry.reported[slot] holds the last message logged for that
+-- slot, and only a different message is logged again.  Successful calls do
+-- not touch it.
+local function call_handler(entry, slot, ...)
+	local handler = entry.handlers[slot]
+	if handler == nil then return nil, false end
+	local ok, a, b = pcall(handler, ...)
+	if not ok then
+		local message = tostring(a)
+		local reported = entry.reported
+		if reported[slot] ~= message then
+			reported[slot] = message
+			log_error("CORE", "%s.%s failed: %s", entry.id, slot, message)
+		end
+		return nil, false
+	end
+	return a, true, b
+end
+
+
+local function add_to(map, key, entry)
+	local list = map[key]
+	if not list then
+		list = {}
+		map[key] = list
+	end
+	list[#list + 1] = entry
+end
+
+
+local function sort_lists(map)
+	for _, list in pairs(map) do table.sort(list, compare) end
+end
+
+
+local function rebuild_orders()
+	module_order = {}
+	event_routes = {}
+	reset_routes = {}
+	wake_routes = {}
+	route_guards = {}
+	observe_by_bind = {}
+	claim_by_bind = {}
+	observe_by_dik = {}
+	claim_by_dik = {}
+	raw_by_dik = {}
+	for _, entry in pairs(entries) do
+		module_order[#module_order + 1] = entry
+		for index = 1, #entry.events do add_to(event_routes, entry.events[index], entry) end
+		for index = 1, #entry.resets do add_to(reset_routes, entry.resets[index], entry) end
+		for index = 1, #entry.wake_only do add_to(wake_routes, entry.wake_only[index], entry) end
+		for index = 1, #entry.route_names do
+			local name = entry.route_names[index]
+			local guard = entry.optional[name]
+			local guards = route_guards[name]
+			if not guards then
+				guards = { unguarded = false }
+				route_guards[name] = guards
+			end
+			if guard then guards[#guards + 1] = guard else guards.unguarded = true end
+		end
+		for index = 1, #entry.observe_binds do add_to(observe_by_bind, entry.observe_binds[index], entry) end
+		for index = 1, #entry.claim_binds do add_to(claim_by_bind, entry.claim_binds[index], entry) end
+		local dik = entry.watch
+		if dik ~= nil then
+			if entry.has_observe then add_to(observe_by_dik, dik, entry) end
+			if entry.has_claim then add_to(claim_by_dik, dik, entry) end
+			if entry.has_raw then add_to(raw_by_dik, dik, entry) end
+		end
+	end
+	table.sort(module_order, compare)
+	sort_lists(event_routes)
+	sort_lists(reset_routes)
+	sort_lists(wake_routes)
+	sort_lists(observe_by_bind)
+	sort_lists(claim_by_bind)
+	sort_lists(observe_by_dik)
+	sort_lists(claim_by_dik)
+	sort_lists(raw_by_dik)
+end
+
+
+local function string_list(value, label, seen)
+	if value == nil then return {}, nil end
+	if type(value) ~= "table" then return nil, label .. " must be a list" end
+	local list = {}
+	for index = 1, #value do
+		local name = value[index]
+		if type(name) ~= "string" or name == "" then
+			return nil, label .. "[" .. index .. "] must be a non-empty string"
+		end
+		if seen then
+			if seen[name] then return nil, "'" .. name .. "' is declared twice" end
+			seen[name] = true
+		end
+		list[#list + 1] = name
+	end
+	return list, nil
+end
+
+
+local function bind_list(value, label)
+	local names, err = string_list(value, label, nil)
+	if not names then return nil, err end
+	local binds = {}
+	for index = 1, #names do
+		local name = names[index]
+		-- The engine's key_bindings is a luabind enum: userdata, not a table.
+		local bind = key_bindings ~= nil and key_bindings[name] or nil
+		if bind == nil then return nil, label .. " names unknown key_bindings field '" .. name .. "'" end
+		binds[#binds + 1] = bind
+	end
+	return binds, nil
+end
+
+
+-- Validates a descriptor and returns the internal entry or nil plus an error.
+local function build_entry(spec)
+	if type(spec) ~= "table" then return nil, "descriptor must be a table" end
+	if type(spec.id) ~= "string" or spec.id == "" then return nil, "descriptor id must be a non-empty string" end
+	if spec.id == CONSOLE_ID then return nil, "descriptor id '" .. CONSOLE_ID .. "' is reserved" end
+	if type(spec.priority) ~= "number" then return nil, "descriptor priority must be a number" end
+	if type(spec.handlers) ~= "table" then return nil, "descriptor handlers must be a table" end
+	for slot, handler in pairs(spec.handlers) do
+		if HANDLER_SLOTS[slot] == nil then return nil, "unknown handler slot '" .. tostring(slot) .. "'" end
+		if type(handler) ~= "function" then return nil, "handler '" .. tostring(slot) .. "' must be a function" end
+	end
+	local seen = {}
+	local events, err = string_list(spec.events, "events", seen)
+	if not events then return nil, err end
+	local resets
+	resets, err = string_list(spec.resets, "resets", seen)
+	if not resets then return nil, err end
+	local wake_only
+	wake_only, err = string_list(spec.wake_only, "wake_only", seen)
+	if not wake_only then return nil, err end
+	if #events > 0 and spec.handlers.event == nil then return nil, "events declared without an event handler" end
+	local optional = {}
+	if spec.optional ~= nil then
+		if type(spec.optional) ~= "table" then return nil, "optional must be a table" end
+		for name, guard in pairs(spec.optional) do
+			if type(name) ~= "string" or type(guard) ~= "string" or guard == "" then
+				return nil, "optional entries must map an event name to a global name"
+			end
+			if not seen[name] then return nil, "optional names undeclared event '" .. name .. "'" end
+			optional[name] = guard
+		end
+	end
+	local observe_binds, claim_binds = {}, {}
+	if spec.input ~= nil then
+		if type(spec.input) ~= "table" then return nil, "input must be a table" end
+		observe_binds, err = bind_list(spec.input.observe, "input.observe")
+		if not observe_binds then return nil, err end
+		claim_binds, err = bind_list(spec.input.claim, "input.claim")
+		if not claim_binds then return nil, err end
+	end
+	local handlers = spec.handlers
+	local has_claim = handlers.key_press ~= nil or handlers.key_hold ~= nil or handlers.key_release ~= nil
+	if #observe_binds > 0 and handlers.observe == nil then return nil, "input.observe declared without an observe handler" end
+	if #claim_binds > 0 and not has_claim then return nil, "input.claim declared without a key handler" end
+	local route_names = {}
+	for name, _ in pairs(seen) do route_names[#route_names + 1] = name end
+	table.sort(route_names)
+	return {
+		id = spec.id, priority = spec.priority, handlers = handlers,
+		events = events, resets = resets, wake_only = wake_only, optional = optional,
+		route_names = route_names, observe_binds = observe_binds, claim_binds = claim_binds,
+		has_observe = handlers.observe ~= nil, has_claim = has_claim, has_raw = handlers.raw_key ~= nil,
+		active = true, watch = nil, omark = 0, cmark = 0, reported = {},
+	}, nil
+end
+
+
+-- A module whose init raises is removed with its scheduler slot, any deadline
+-- its init set and any flag it published.
+local function install_entry(entry)
+	local id = entry.id
+	entries[id] = entry
+	schedule[id] = { due = nil, running = false }
+	rebuild_orders()
+	local handler = entry.handlers.init
+	if handler ~= nil then
+		local ok, err = pcall(handler, _G.apb_v2_core)
+		if not ok then
+			log_error("CORE", "module %s init failed: %s", id, tostring(err))
+			entries[id] = nil
+			sleep(id)
+			schedule[id] = nil
+			clear_flags(id)
+			rebuild_orders()
+			return false
+		end
+	end
+	if started then wake(id, 0) end
+	return true
+end
+
+
+-- Registers one MODULE descriptor.  The optional namespace is only stored so
+-- module(id) can hand it back to tooling; the core never indexes it.
+function register(spec, namespace)
+	local entry, err = build_entry(spec)
+	if entry and entries[entry.id] then err, entry = "id '" .. entry.id .. "' is already registered", nil end
+	if not entry then
+		log_error("CORE", "module %s rejected: %s",
+			type(spec) == "table" and tostring(spec.id) or "?", tostring(err))
+		return false
+	end
+	entry.module = namespace
+	return install_entry(entry)
+end
+
+
+function module(id)
+	local entry = entries[id]
+	return entry and entry.module or nil
+end
+
+
+function set_active(id, active)
+	local entry = entries[id]
+	if not entry then return false end
+	entry.active = active and true or false
+	return true
+end
+
+
+function watch_dik(id, dik)
+	local entry = entries[id]
+	dik = tonumber(dik)
+	if not entry or dik == nil then return false end
+	if entry.watch ~= dik then
+		entry.watch = dik
+		rebuild_orders()
+	end
+	return true
+end
+
+
+function unwatch_dik(id)
+	local entry = entries[id]
+	if not entry then return false end
+	if entry.watch ~= nil then
+		entry.watch = nil
+		rebuild_orders()
+	end
+	return true
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Scheduler
+
+local function recompute_next_due()
+	local earliest = nil
+	for _, state in pairs(schedule) do
+		if state.due ~= nil and (earliest == nil or state.due < earliest) then
+			earliest = state.due
+		end
+	end
+	scheduler_next_due = earliest
+end
+
+
+function wake(id, delay_ms)
+	local state = schedule[id]
+	if not state then return false end
+	local due = now_ms() + math.max(0, tonumber(delay_ms) or 0)
+	if state.due == nil or due < state.due then state.due = due end
+	if scheduler_next_due == nil or state.due < scheduler_next_due then
+		scheduler_next_due = state.due
+	end
+	return true
+end
+
+
+function sleep(id)
+	local state = schedule[id]
+	if not state then return false end
+	local was_earliest = state.due ~= nil and state.due == scheduler_next_due
+	state.due = nil
+	if was_earliest then recompute_next_due() end
+	return true
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Console-variable ownership: the '__console' pseudo-module re-verifies every
+-- owned variable on the deadline scheduler and restores the snapshot on release.
+--
+-- The snapshot is the player's own value from before APB first took the
+-- variable, and it has to outlive the session: the engine writes every console
+-- value to user.ltx when the game closes (cfg_save in destroyConsole), so a
+-- snapshot kept only in memory would read APB's own forced value back in the
+-- next session and the player's setting would be lost.  It is therefore kept
+-- in axr_options.ltx through axr_main.config -- the per-install settings file
+-- that belongs to no save, where GAMMA scripts such as lower_weapon_sprint
+-- keep sections of their own -- one line per variable under SNAPSHOT_SECTION,
+-- written when the variable is first taken and removed once it is given back.
+-- Without axr_main.config the snapshot simply lives in memory.
+
+local SNAPSHOT_SECTION = "advanced_player_behavior_console_snapshot"
+
+
+local function console_command(name, value)
+	return name .. " " .. (value and "1" or "0")
+end
+
+
+local function snapshot_store()
+	local axr = rawget(_G, "axr_main")
+	if type(axr) ~= "table" then return nil end
+	return axr.config
+end
+
+
+local function stored_snapshot(name)
+	local store = snapshot_store()
+	if store == nil then return nil end
+	local value, ok = safe_method(store, "r_value", SNAPSHOT_SECTION, name, 0, nil)
+	if not ok or value == nil or value == "" then return nil end
+	return normalize(value)
+end
+
+
+local function store_snapshot(name, value)
+	local store = snapshot_store()
+	if store == nil then return false end
+	local _, written = safe_method(store, "w_value", SNAPSHOT_SECTION, name, value and "1" or "0")
+	if not written then return false end
+	local _, saved = safe_method(store, "save")
+	return saved
+end
+
+
+local function forget_snapshot(name)
+	if stored_snapshot(name) == nil then return end
+	local store = snapshot_store()
+	local _, removed = safe_method(store, "remove_line", SNAPSHOT_SECTION, name)
+	if not removed then safe_method(store, "w_value", SNAPSHOT_SECTION, name, "") end
+	safe_method(store, "save")
+end
+
+
+-- A console variable is owned only over a value the core can give back.  A
+-- record whose first read failed carries no snapshot and is never written;
+-- every interval pass re-attempts the read, and the moment the console
+-- answers the snapshot is taken (and stored) and the wanted value enforced.
+-- One read serves both, so the recovery costs nothing on the settled path.
+local function assert_console(record)
+	local current = console_bool(record.name)
+	if current == nil then return end
+	if record.snapshot == nil then
+		record.snapshot = current
+		store_snapshot(record.name, current)
+	end
+	if current ~= record.wanted then
+		console_execute(console_command(record.name, record.wanted))
+	end
+end
+
+
+local function console_update(now)
+	local next_delay = nil
+	for index = 1, #owned_console_order do
+		local record = owned_console[owned_console_order[index]]
+		if record.interval > 0 then
+			if now >= record.next_check then
+				assert_console(record)
+				record.next_check = now + record.interval
+			end
+			local delay = record.next_check - now
+			if next_delay == nil or delay < next_delay then next_delay = delay end
+		end
+	end
+	return next_delay
+end
+
+
+function own_console(name, wanted, interval_ms)
+	if type(name) ~= "string" or name == "" then return false end
+	wanted = truthy(wanted, false)
+	local record = owned_console[name]
+	local claimed = record == nil
+	if claimed then
+		-- A stored snapshot was taken before APB's first claim in an earlier
+		-- session; the live console value is APB's own by then.  Without one,
+		-- assert_console below takes it from the live value.
+		record = { name = name, snapshot = stored_snapshot(name) }
+		owned_console[name] = record
+		owned_console_order[#owned_console_order + 1] = name
+	end
+	record.wanted = wanted
+	record.interval = math.max(0, tonumber(interval_ms) or 0)
+	assert_console(record)
+	if claimed and record.snapshot == nil then
+		-- Reported once, at the failed first read: assert_console retries
+		-- silently on the interval rather than logging every pass.
+		log_error("CORE", "could not snapshot %s; ownership deferred until the console answers", name)
+	end
+	record.next_check = now_ms() + record.interval
+	if record.interval > 0 then wake(CONSOLE_ID, record.interval) end
+	return true
+end
+
+
+-- Restores the snapshot unless the console already holds it, then drops the
+-- stored copy.
+local function give_back(name, snapshot)
+	if snapshot ~= nil and console_bool(name) ~= snapshot then
+		console_execute(console_command(name, snapshot))
+	end
+	forget_snapshot(name)
+end
+
+
+-- Gives a console variable back.  A variable this session never took can
+-- still carry a snapshot stored by an earlier session -- its owner was switched
+-- off before claiming it again, for example in MCM at the main menu -- and
+-- that snapshot is still the player's own value, so it is restored and removed
+-- the same way.  false when there was nothing to give back.
+function release_console(name)
+	local record = owned_console[name]
+	if not record then
+		local snapshot = stored_snapshot(name)
+		if snapshot == nil then return false end
+		give_back(name, snapshot)
+		return true
+	end
+	owned_console[name] = nil
+	for index = 1, #owned_console_order do
+		if owned_console_order[index] == name then
+			table.remove(owned_console_order, index)
+			break
+		end
+	end
+	give_back(name, record.snapshot)
+	if #owned_console_order == 0 then sleep(CONSOLE_ID) end
+	return true
+end
+
+
+console_entry = { id = CONSOLE_ID, handlers = { update = console_update } }
+schedule[CONSOLE_ID] = { due = nil, running = false }
+
+
+-- ---------------------------------------------------------------------------
+-- Synthetic-action seam
+
+function set_input_chain(chain)
+	if type(chain) ~= "table" then return false end
+	input_chain = chain
+	return true
+end
+
+
+function is_synthetic()
+	return synthetic_depth > 0
+end
+
+
+-- The bind of the synthetic edge in flight; nil outside one.
+function synthetic_bind()
+	return current_synthetic_bind
+end
+
+
+function synthetic_action(phase, dik, bind, ...)
+	local handler = input_chain and input_chain[phase]
+	local outer_bind = current_synthetic_bind
+	current_synthetic_bind = bind
+	synthetic_depth = synthetic_depth + 1
+	local ok, result = pcall(handler, dik, bind, ...)
+	synthetic_depth = synthetic_depth - 1
+	current_synthetic_bind = outer_bind
+	invalidate_epoch()
+	if not ok then
+		log_error("INPUT", "synthetic %s failed: %s", tostring(phase), tostring(result))
+		return nil, false
+	end
+	return result, true
+end
+
+
+function synthetic_cycle(dik, bind, dis, ...)
+	local press, ok = synthetic_action("press", dik, bind, dis, ...)
+	if not ok then return nil, false end
+	local release, released = synthetic_action("release", dik, bind, dis, ...)
+	return release == nil and press or release, released
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Deferred presses
+--
+-- CInput::KeyUpdate stores a whole DirectInput batch's key states before it
+-- dispatches the batch, so a tap whose press and release share one batch reads
+-- key_state as up at both edges, exactly like a script's level.press_action.
+-- Both edges of such a tap are dispatched before the next actor update.  A
+-- module that would claim a press it cannot confirm defers it, and the release
+-- in the same batch takes it back; a record still pending when update() runs
+-- had no release -- a script's press, not the player's key -- and is replayed
+-- once to the native chain.
+
+local deferred_presses = {}
+local deferred_logged = false
+
+
+function defer_press(id, dik, bind)
+	if dik == nil then return false end
+	deferred_presses[dik] = { id = id, bind = bind }
+	return true
+end
+
+
+-- true, and the record dropped, when module id deferred this DIK's press.
+function take_deferred_press(id, dik)
+	local record = deferred_presses[dik]
+	if not record or record.id ~= id then return false end
+	deferred_presses[dik] = nil
+	return true
+end
+
+
+local function replay_deferred_presses()
+	for dik, record in pairs(deferred_presses) do
+		deferred_presses[dik] = nil
+		if not deferred_logged then
+			deferred_logged = true
+			log_info("INPUT", "%s press passed through | dik=%s | reason=no release in its input batch (logged once)",
+				tostring(record.id), tostring(dik))
+		end
+		synthetic_action("press", dik, record.bind, false)
+	end
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Shared action-down registry, fed by the observe funnel
+
+function track_bind(bind)
+	if bind == nil then return false end
+	if not tracked_binds[bind] then tracked_binds[bind] = { down = {}, pruned = -1 } end
+	return true
+end
+
+
+function bind_down(bind)
+	local record = tracked_binds[bind]
+	if not record then return false end
+	if record.pruned ~= hardware_epoch then
+		record.pruned = hardware_epoch
+		prune_unconfirmed_down(record.down)
+	end
+	return next(record.down) ~= nil
+end
+
+
+local function record_edge(phase, dik, bind)
+	local record = tracked_binds[bind]
+	if not record or dik == nil then return end
+	if phase == "release" then
+		record.down[dik] = nil
+	elseif phase == "press" then
+		if confirmed_down(dik) then record.down[dik] = true end
+	end
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Input dispatch: the per-bind list and the per-DIK list are merged in
+-- priority order without allocating; a module in both lists is visited once.
+
+local function pick_head(a, ia, b, ib)
+	local best, which = nil, 0
+	local head = a and a[ia]
+	if head then best, which = head, 1 end
+	head = b and b[ib]
+	if head and (best == nil or compare(head, best)) then best, which = head, 2 end
+	return best, which
+end
+
+
+function observe_input(phase, dik, bind, dis, ...)
+	record_edge(phase, dik, bind)
+	local by_bind = bind ~= nil and observe_by_bind[bind] or nil
+	local by_dik = dik ~= nil and observe_by_dik[dik] or nil
+	local ia, ib = 1, 1
+	observe_mark = observe_mark + 1
+	local mark = observe_mark
+	while true do
+		local entry, which = pick_head(by_bind, ia, by_dik, ib)
+		if not entry then break end
+		if which == 1 then ia = ia + 1 else ib = ib + 1 end
+		if entry.omark ~= mark then
+			entry.omark = mark
+			if entry.active then call_handler(entry, "observe", phase, dik, bind, dis, ...) end
+		end
+	end
+	return true
+end
+
+
+function dispatch_input(phase, dik, bind, dis, ...)
+	if synthetic_depth > 0 then return false end
+	observe_input(phase, dik, bind, dis, ...)
+	local slot = KEY_METHOD[phase]
+	if not slot then return false end
+	local by_bind = bind ~= nil and claim_by_bind[bind] or nil
+	local by_dik = dik ~= nil and claim_by_dik[dik] or nil
+	local ia, ib = 1, 1
+	claim_mark = claim_mark + 1
+	local mark = claim_mark
+	while true do
+		local entry, which = pick_head(by_bind, ia, by_dik, ib)
+		if not entry then break end
+		if which == 1 then ia = ia + 1 else ib = ib + 1 end
+		if entry.cmark ~= mark then
+			entry.cmark = mark
+			if entry.active then
+				local handled, ok, result = call_handler(entry, slot, dik, bind, dis, ...)
+				if ok and handled then return true, result end
+			end
+		end
+	end
+	return false
+end
+
+
+function dispatch_raw_key(dik)
+	local by_dik = dik ~= nil and raw_by_dik[dik] or nil
+	if not by_dik then return false end
+	for index = 1, #by_dik do
+		local entry = by_dik[index]
+		if entry.active then
+			local handled, ok = call_handler(entry, "raw_key", dik)
+			if ok and handled then return true end
+		end
+	end
+	return false
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Events
+
+function dispatch_event(name, ...)
+	local resets = reset_routes[name]
+	if MUTATION_EVENTS[name] then
+		invalidate_mutations()
+	elseif resets or FRAME_EVENTS[name] then
+		frame_epoch = frame_epoch + 1
+	end
+	-- A sleeping subsystem is not called: a module that slept itself and
+	-- cleared its active flag stays asleep, the way input dispatch and raw
+	-- keys already treat it; reset routes below stay unconditional, because
+	-- teardown must reach every module whatever its flag says.
+	local wakes = wake_routes[name]
+	if wakes then
+		for index = 1, #wakes do
+			local entry = wakes[index]
+			if entry.active then wake(entry.id, 0) end
+		end
+	end
+	if resets then
+		for index = 1, #resets do
+			local entry = resets[index]
+			clear_flags(entry.id)
+			call_handler(entry, "reset", name)
+			wake(entry.id, 0)
+		end
+	end
+	local route = event_routes[name]
+	if route then
+		for index = 1, #route do call_handler(route[index], "event", name, ...) end
+	end
+end
+
+
+local function route_available(name)
+	local guards = route_guards[name]
+	if guards.unguarded then return true end
+	for index = 1, #guards do
+		if rawget(_G, guards[index]) ~= nil then return true end
+	end
+	return false
+end
+
+
+-- Every engine callback name the composition root must register: event,
+-- reset and wake-only routes, minus INTERNAL_EVENTS and optional routes whose
+-- guard global is nil, plus the mutation events (a guarded one only while its
+-- guard loads).
+function event_names()
+	local names = {}
+	for name, _ in pairs(route_guards) do
+		if not INTERNAL_EVENTS[name] and route_available(name) then names[#names + 1] = name end
+	end
+	for name, _ in pairs(MUTATION_EVENTS) do
+		local guard = MUTATION_EVENT_GUARDS[name]
+		if route_guards[name] == nil and (guard == nil or rawget(_G, guard) ~= nil) then
+			names[#names + 1] = name
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+
+-- The composition root hands over function(name) that re-registers the
+-- stored engine route closure for that event name (see REASSERTED_ROUTES).
+function set_route_reasserter(fn)
+	if fn ~= nil and type(fn) ~= "function" then return false end
+	route_reasserter = fn
+	return true
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Lifecycle
+
+function option_change()
+	clear_dik_cache()
+	invalidate_mutations()
+	refresh_settings()
+	for index = 1, #module_order do
+		local entry = module_order[index]
+		call_handler(entry, "option_change")
+		wake(entry.id, 0)
+	end
+	if route_reasserter then
+		for index = 1, #REASSERTED_ROUTES do
+			local _, ok, err = safe_call(route_reasserter, REASSERTED_ROUTES[index])
+			if not ok then log_error("CORE", "route reassert %s failed: %s", REASSERTED_ROUTES[index], tostring(err)) end
+		end
+	end
+end
+
+
+function reset(reason)
+	clear_dik_cache()
+	clear_flags(nil)
+	for dik, _ in pairs(deferred_presses) do deferred_presses[dik] = nil end
+	frame_epoch = frame_epoch + 1
+	for index = 1, #module_order do
+		local entry = module_order[index]
+		call_handler(entry, "reset", reason)
+		sleep(entry.id)
+	end
+end
+
+
+function save_state(m_data)
+	local root = m_data[SAVE_ROOT]
+	if type(root) ~= "table" then
+		root = {}
+		m_data[SAVE_ROOT] = root
+	end
+	root.schema = SAVE_SCHEMA
+	for index = 1, #module_order do call_handler(module_order[index], "save", m_data) end
+end
+
+
+-- The APB root of a save's m_data, or nil when it is missing or was written
+-- under another SAVE_SCHEMA.
+function saved_root(m_data)
+	local root = type(m_data) == "table" and m_data[SAVE_ROOT] or nil
+	return type(root) == "table" and root.schema == SAVE_SCHEMA and root or nil
+end
+
+
+function load_state(m_data)
+	reset("load")
+	for index = 1, #module_order do call_handler(module_order[index], "load", m_data) end
+	dispatch_event("load_complete", m_data)
+end
+
+
+local function run_due(entry, now)
+	local state = schedule[entry.id]
+	if not (state and state.due ~= nil and now >= state.due and not state.running) then return end
+	state.running = true
+	state.due = nil
+	local delay, called = call_handler(entry, "update", now)
+	state.running = false
+	if called and delay ~= nil then
+		delay = math.max(0, tonumber(delay) or 0)
+		local due = now + delay
+		if state.due == nil or due < state.due then state.due = due end
+	end
+end
+
+
+function update()
+	if next(deferred_presses) ~= nil then replay_deferred_presses() end
+	if scheduler_next_due == nil then
+		invalidate_epoch()
+		return
+	end
+	local now = sample_clock()
+	if now < scheduler_next_due then return end
+	for index = 1, #module_order do run_due(module_order[index], now) end
+	run_due(console_entry, now)
+	recompute_next_due()
+end
+
+
+function start()
+	if started then return end
+	started = true
+	option_change()
+	log_info(nil, "core ready | build=%s | scheduler=deadline/event", BUILD)
+end

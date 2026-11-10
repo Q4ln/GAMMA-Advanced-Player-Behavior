@@ -1,0 +1,194 @@
+-- Advanced Player Behavior v2 Suit Setups facade.
+--
+-- This filename intentionally wins G_FLAT's Remember Outfit Belt conflict.
+-- It suppresses the old automatic callbacks while exposing one APB module to
+-- the shared router. No engine callback is registered here.
+
+local MODULE_ID = "suit"
+local SAVE_BUCKET = "suit_setups"
+
+local model = apb_v2_suit_model
+local equipment = apb_v2_suit_equipment
+local transaction = apb_v2_suit_transaction
+local manager = apb_v2_suit_manager
+local wheel = apb_v2_suit_wheel
+
+SLOT_COUNT = model.SLOT_COUNT
+
+-- The registry's data policy, re-exported so the two UIs need no second suit
+-- dependency: this module is the only seam they and the router talk to.
+STATUS_EMPTY = model.STATUS_EMPTY
+STATUS_EQUIPPED = model.STATUS_EQUIPPED
+STATUS_UNAVAILABLE = model.STATUS_UNAVAILABLE
+STATUS_PARTIAL = model.STATUS_PARTIAL
+STATUS_READY = model.STATUS_READY
+
+-- Reset reasons: core.load_state passes "load"; the resets route passes the
+-- raw teardown event names listed in MODULE.resets.
+-- Teardown route -> (restore previous equipment, reason).  The reason is the
+-- whole content of the transaction's cancellation log line, so these strings
+-- are load-bearing.  Data rather than captured functions, so this file does
+-- not depend on apb_v2_suit_transaction having loaded first.
+local CANCEL = {
+	load = {false, "load state"},
+	on_before_level_changing = {true, "level change"},
+	actor_on_before_death = {true, "actor death"},
+	actor_on_net_destroy = {true, "actor net destroy"},
+}
+
+local core
+local initialized = false
+local wheel_key = -1
+
+local function wake(delay)
+	core.wake(MODULE_ID, delay or 0)
+end
+
+local function configured_wheel_key()
+	local value = tonumber(core.get_setting("v2_suit_setups/open_wheel"))
+	return value and value >= 0 and math.floor(value) or -1
+end
+
+-- The core routes dispatch_raw_key by watched DIK, so only the configured
+-- wheel key ever reaches on_raw_key_press; an unbound wheel gets no route.
+local function sync_wheel_watch()
+	if wheel_key >= 0 then
+		core.watch_dik(MODULE_ID, wheel_key)
+	else
+		core.unwatch_dik(MODULE_ID)
+	end
+end
+
+function init(api)
+	if initialized then return true end
+	core = api
+
+	transaction.configure({core = core, now = core.now_ms, wake = wake})
+	wheel.configure({apply = apply_slot, wake = wake, now = core.now_ms})
+	wheel_key = configured_wheel_key()
+	sync_wheel_watch()
+	if not manager.register_functor() then
+		core.log_error("SUIT-SETUPS", "context functor registration was unavailable")
+	end
+	initialized = true
+	core.log_info("SUIT-SETUPS", "installed | build=%s | schema=%d | slots=%d | scheduler=shared",
+		core.BUILD, model.SCHEMA, SLOT_COUNT)
+	return true
+end
+
+function get_slot(index)
+	return model.get_slot(index)
+end
+
+function is_busy()
+	return transaction.is_busy()
+end
+
+function get_slots_view()
+	return equipment.get_slots_view(model.snapshot_slots(), transaction.is_busy(), model)
+end
+
+-- Section 9.2: every registry write fails closed while a transaction is live.
+-- The guard lives here rather than in apb_v2_suit_model so the registry never
+-- reaches back into the transaction. The view already clears can_save/
+-- can_overwrite/can_rename/can_delete while busy, so the UIs never see this.
+function save_slot(slot, name)
+	if transaction.is_busy() then return false, "invalid_slot" end
+	return model.save_slot(slot, name)
+end
+
+function overwrite_slot(slot)
+	if transaction.is_busy() then return false, "invalid_slot" end
+	return model.overwrite_slot(slot)
+end
+
+function rename_slot(slot, name)
+	if transaction.is_busy() then return false, "invalid_slot" end
+	return model.rename_slot(slot, name)
+end
+
+function delete_slot(slot)
+	if transaction.is_busy() then return false, "invalid_slot" end
+	return model.delete_slot(slot)
+end
+
+-- Keystroke-time clipping for the manager's name editor; no registry write.
+function sanitize_name_live(value)
+	return model.sanitize_name_live(value)
+end
+
+function apply_slot(index)
+	local ok, reason = transaction.apply(index)
+	if ok then wake(0) end
+	return ok, reason
+end
+
+function on_raw_key_press()
+	if wheel.is_open() then return true end
+	local opened = wheel.open(wheel_key)
+	if opened then wake(0) end
+	return opened == true
+end
+
+function on_option_change()
+	local next_key = configured_wheel_key()
+	if next_key ~= wheel_key then
+		wheel.reset()
+		wheel_key = next_key
+		sync_wheel_watch()
+	end
+end
+
+function on_update(now)
+	local transaction_delay = transaction.on_update(now)
+	local down, known = false, false
+	if wheel.is_open() then
+		down, known = core.hardware_down(wheel_key)
+	end
+	local wheel_delay = wheel.on_update(now, down, known)
+	if transaction_delay == nil then return wheel_delay end
+	if wheel_delay == nil then return transaction_delay end
+	return math.min(transaction_delay, wheel_delay)
+end
+
+-- core.save_state has already created and schema-stamped m_data[core.SAVE_ROOT].
+function save(m_data)
+	m_data[core.SAVE_ROOT][SAVE_BUCKET] = model.export_bucket()
+end
+
+-- core.load_state has already run reset("load") for every module, so the
+-- transaction/UI teardown is not repeated here. m_data is not type-checked by
+-- core before load; saved_root accepts anything.
+function load(m_data)
+	local root = core.saved_root(m_data)
+	local bucket = root and root[SAVE_BUCKET] or nil
+	local loaded = model.import_bucket(bucket)
+	if not loaded and bucket ~= nil then
+		core.log_error("SUIT-SETUPS", "discarded corrupt or unknown Suit save bucket")
+	end
+	return loaded
+end
+
+function reset(reason)
+	local cancel = CANCEL[reason]
+	if cancel then transaction.cancel(cancel[1], cancel[2]) end
+	manager.reset()
+	wheel.reset()
+end
+
+-- Every route this module needs is a teardown reset; the wheel key arrives
+-- through the DIK watch registered by sync_wheel_watch, not a bind claim.
+MODULE = {
+	id = MODULE_ID,
+	priority = 20,
+	resets = { "on_before_level_changing", "actor_on_before_death", "actor_on_net_destroy" },
+	handlers = {
+		init = init,
+		option_change = on_option_change,
+		update = on_update,
+		reset = reset,
+		save = save,
+		load = load,
+		raw_key = on_raw_key_press,
+	},
+}

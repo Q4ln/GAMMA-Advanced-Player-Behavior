@@ -1,0 +1,1360 @@
+-- Magazine assignment service of Advanced Player Behavior's magazine
+-- subsystem.  Explicit assignment overrides live in binder records; a keyless
+-- live loadout magazine follows its top-round family, or regular ammo when
+-- empty.  Fixed filename; see zzz_mags_compat_core.
+local AMMO_KEY = "aml_preferred_ammo"
+local SLOT_KEY = "aml_assignment_slot"
+local LOADOUT_KEY = "mags_loadout_order"
+local NEXT_ORDER_KEY = "mags_loadout_next_order"
+local LEGACY_LOOSE_KEY = "mags_aml_field_assignments"
+local LEGACY_LOADED_KEY = "mags_aml_loaded_assignments"
+local EVENT_GROUP = "mags_assignment_service"
+local READY_EVENT = "equipment_ready"
+local UNKNOWN_SLOT = 0
+local TRANSFER_TIMEOUT = 5000
+local TRANSFER_ATTEMPTS = 300
+local original = {}
+local tracked = {}
+local dormant = {}
+local transitions = {}
+local target_sources = {}
+local hooks = { binder = false, description = false, retool = false, disassembly = false, highlight = false }
+local callbacks_registered = false
+local functors_registered = false
+local equipment_ready = false
+local next_reconcile = 0
+local next_loadout_order = 1
+local layout_dirty, layout_running, layout_signature = true, false, nil
+-- An inventory event asks for one sweep instead of running one: a single item
+-- move fires two registered callbacks and a take-all fires one per magazine,
+-- and every repack walks the whole actor inventory.  The request is drained at
+-- the next actor update, and every reader that can run before that drain goes
+-- through ensure_layout, as room_in_pouch does.
+local repack_requested = false
+local core = zzz_mags_compat_core
+local now_ms, object_id = core.now_ms, core.object_id
+local pack, copy_value = core.pack_results, core.deep_copy
+local section_of, refresh_inventory = core.section_of, core.inventory_refresh
+local data_for, object_is_weapon = core.data_for, core.is_weapon
+local loaded_slot, choose_ammo = core.equipped_slot, core.find_ammo
+local translate
+local log_info, log_error = core.log_info, core.log_error
+local BUILD = core.BUILD
+-- `this` is this script's own namespace table; the compat core owns the
+-- registry so no consumer needs a raw global lookup.
+core.register_service("assignment", this)
+local function commit(id, data)
+	if not (id and magazine_binder and type(magazine_binder.set_data) == "function") then return false end
+	local ok, err = pcall(magazine_binder.set_data, id, data)
+	if not ok then log_error("assignment: binder write failed | id=%s | %s", tostring(id), tostring(err)) end
+	return ok
+end
+local function commit_assignment(id, data, preferred, slot)
+	data[AMMO_KEY], data[SLOT_KEY] = preferred, slot; return commit(id, data)
+end
+local function is_carried(id)
+	if not (id and magazine_binder and type(magazine_binder.is_carried_mag) == "function") then return false end
+	local ok, value = pcall(magazine_binder.is_carried_mag, id)
+	return ok and value and true or false
+end
+local function loadout_order(data)
+	local value = type(data) == "table" and tonumber(data[LOADOUT_KEY]) or nil
+	if not value or value ~= math.floor(value) or value < 1 then return nil end
+	return value
+end
+local function observe_order(value)
+	value = tonumber(value)
+	if value and value >= next_loadout_order then next_loadout_order = math.floor(value) + 1 end
+end
+local function allocate_order()
+	local value = next_loadout_order
+	next_loadout_order = value + 1
+	return value
+end
+local function actor_owned(id)
+	local actor = db and db.actor
+	if not (id and actor) then return nil end
+	local actor_id, observed = object_id(actor), nil
+	if level and type(level.object_by_id) == "function" then
+		local ok, obj = pcall(level.object_by_id, id)
+		if ok and obj then
+			if utils_item and type(utils_item.in_actor_inv) == "function" then
+				local own_ok, own = pcall(utils_item.in_actor_inv, obj)
+				if own_ok and own then return true end
+				if own_ok then observed = false end
+			end
+			local parent_ok, parent = pcall(function() return obj:parent() end)
+			if parent_ok and parent then return object_id(parent) == actor_id end
+		end
+	end
+	if alife_object then
+		local ok, se = pcall(alife_object, id)
+		if ok and se and se.parent_id ~= nil then return se.parent_id == actor_id end
+	end
+	return observed
+end
+local function normalize_slot(value)
+	local slot = tonumber(value)
+	if not slot or slot ~= math.floor(slot) or slot < 1 or slot > 3 then return nil end
+	return slot end
+local function allowed_ammo(magazine)
+	if not (magazine_binder and type(magazine_binder.is_magazine) == "function" and
+		type(magazine_binder.get_magazine_caliber) == "function") then return nil end
+	local ok, is_magazine = pcall(magazine_binder.is_magazine, magazine)
+	if not (ok and is_magazine) then return nil end
+	local allowed
+	ok, allowed = pcall(magazine_binder.get_magazine_caliber, magazine)
+	return ok and type(allowed) == "table" and allowed or nil
+end
+local function ammo_priority(magazine, preferred)
+	if type(preferred) ~= "string" or preferred == "" then return nil end
+	local allowed = allowed_ammo(magazine)
+	if not allowed then return nil end
+	local compatible, result, seen = false, { preferred }, { [preferred] = true }
+	for i = 1, #allowed do if allowed[i] == preferred then compatible = true break end end
+	if not compatible then return nil end
+	for i = 1, #allowed do
+		local section = allowed[i]
+		if section and not seen[section] then result[#result + 1], seen[section] = section, true end
+	end
+	return result
+end
+local function assigned_priority(magazine, preferred)
+	return ammo_priority(magazine, preferred) and { preferred } or nil
+end
+local function choices(magazine, raw_fallback)
+	local allowed = allowed_ammo(magazine)
+	if not allowed then return {} end
+	local result, seen, first = {}, {}, nil
+	for i = 1, #allowed do
+		local section = allowed[i]
+		if type(section) == "string" and section ~= "" then
+			first = first or section
+			if not seen[section] and not string.match(section, "_bad$") and not string.match(section, "_verybad$") then
+				result[#result + 1], seen[section] = section, true
+			end
+		end
+	end
+	if raw_fallback and #result == 0 and first then result[1] = first end
+	return result
+end
+local function loaded_ammo(data, options)
+	local loaded = type(data.loaded) == "table" and data.loaded or nil
+	local top = loaded and loaded[#loaded] or nil
+	if type(top) == "string" and top ~= "" then
+		local family = string.gsub(top, "_verybad$", "")
+		family = string.gsub(family, "_bad$", "")
+		for i = 1, #options do
+			if options[i] == top or options[i] == family then return options[i] end
+		end
+		if ammo_priority(data.section, top) then return top end
+	end
+end
+local function automatic_ammo(data)
+	local options = choices(data.section, true)
+	return loaded_ammo(data, options) or options[1]
+end
+local function embedded(data)
+	if type(data) ~= "table" then return nil end
+	local preferred = data[AMMO_KEY]
+	if type(data.section) ~= "string" or data.section == "no_mag" or not ammo_priority(data.section, preferred) then return nil end
+	return preferred
+end
+local function index(id, data)
+	if not id then return false end
+	local order = loadout_order(data)
+	if order then observe_order(order) end
+	tracked[id] = (order or embedded(data)) and true or nil
+	if not tracked[id] then dormant[id] = nil end; return tracked[id] ~= nil
+end
+function is_loadout_mag(id, supplied)
+	if not id then return false end
+	local data = type(supplied) == "table" and supplied or data_for(id)
+	return loadout_order(data) ~= nil and actor_owned(id) ~= false
+end
+local function is_loose_loadout_mag(id)
+	local data = id and data_for(id) or nil
+	return data and not data.is_weapon and is_loadout_mag(id, data) or false
+end
+function clear(id, refresh, supplied)
+	if not id then return false end
+	local data = type(supplied) == "table" and supplied or data_for(id)
+	local had = data and (data[AMMO_KEY] ~= nil or data[SLOT_KEY] ~= nil)
+	local changed = had or tracked[id] ~= nil or dormant[id] ~= nil
+	if had then
+		data[AMMO_KEY], data[SLOT_KEY] = nil, nil
+		if not commit(id, data) then tracked[id] = true return false end
+	end
+	index(id, nil)
+	if refresh and changed then refresh_inventory(2) end
+	return changed
+end
+local function forget(id, refresh, supplied)
+	if not id then return false end
+	local data = type(supplied) == "table" and supplied or data_for(id)
+	local had = type(data) == "table" and
+		(data[LOADOUT_KEY] ~= nil or data[AMMO_KEY] ~= nil or data[SLOT_KEY] ~= nil)
+	local changed = had or tracked[id] ~= nil or dormant[id] ~= nil
+	if had then
+		data[LOADOUT_KEY], data[AMMO_KEY], data[SLOT_KEY] = nil, nil, nil
+		if not commit(id, data) then tracked[id] = true return false end
+	end
+	index(id, nil)
+	-- `changed` is exactly the condition under which the packed layout can
+	-- differ.  server_entity_on_unregister reaches this for every despawning
+	-- entity during level streaming, and almost none of them are ours.
+	if changed then layout_dirty = true end
+	if refresh and changed then refresh_inventory(2) end
+	return changed
+end
+function is_live(id)
+	if not is_carried(id) then return false end
+	local data = data_for(id); return data and not data.is_weapon and actor_owned(id) ~= false or false
+end
+local function bootstrap_inserted(id, data)
+	if loadout_order(data) then return true end
+	if not (id and type(data) == "table" and data.is_weapon and data.section ~= "no_mag" and
+		actor_owned(id) ~= false) then return false end
+	local slot = loaded_slot(id)
+	local preferred = embedded(data)
+	-- A legacy explicit assignment may be dormant in inventory. A new,
+	-- unassigned inserted magazine is promoted only while its exact weapon ID
+	-- is actually equipped, so unrelated inventory weapons remain untouched.
+	if not preferred and type(slot) ~= "number" then return false end
+	preferred = preferred or automatic_ammo(data)
+	if not preferred then return false end
+	local former_slot = data[SLOT_KEY]
+	data[LOADOUT_KEY] = allocate_order()
+	data[SLOT_KEY] = type(slot) == "number" and slot or normalize_slot(data[SLOT_KEY]) or UNKNOWN_SLOT
+	if not commit(id, data) then
+		data[LOADOUT_KEY], data[SLOT_KEY] = nil, former_slot
+		return false
+	end
+	tracked[id], layout_dirty = true, true
+	return true
+end
+function read(id, data)
+	data = type(data) == "table" and data or data_for(id)
+	if not data then index(id, nil) return nil end
+	if not loadout_order(data) then
+		if not data.is_weapon and is_carried(id) then
+			data[LOADOUT_KEY] = allocate_order()
+			if not commit(id, data) then return nil end
+			tracked[id], layout_dirty = true, true
+		elseif data.is_weapon and not bootstrap_inserted(id, data) then
+			if data[AMMO_KEY] ~= nil or data[SLOT_KEY] ~= nil then clear(id, false, data) end
+			return nil
+		end
+	end
+	if not loadout_order(data) or actor_owned(id) == false then
+		if data[AMMO_KEY] ~= nil or data[SLOT_KEY] ~= nil then clear(id, false, data) end
+		return nil
+	end
+	if data.is_weapon then
+		local preferred = embedded(data) or automatic_ammo(data)
+		if not preferred then return nil end
+		tracked[id] = true
+		return preferred
+	end
+	local preferred = embedded(data)
+	if not preferred then
+		if data[AMMO_KEY] ~= nil or data[SLOT_KEY] ~= nil then clear(id, false, data) end
+		local source_id = target_sources[id]
+		local pending = source_id and transitions[source_id] or nil
+		if pending and ammo_priority(data.section, pending.preferred) then preferred = pending.preferred
+		else preferred = automatic_ammo(data) end
+		if not preferred then return nil end
+	end
+	if data[SLOT_KEY] ~= nil then
+		data[SLOT_KEY] = nil
+		if not commit(id, data) then return nil end
+	end
+	tracked[id], dormant[id] = true, nil
+	return preferred
+end
+-- For a slotted weapon: read() lets bootstrap_inserted promote an inserted
+-- magazine that is not in the loadout yet.
+local function adopt_slotted(id, data)
+	if data and data.is_weapon and data.section ~= "no_mag" and not loadout_order(data) then read(id, data) end
+end
+function write(id, magazine, ammo, refresh)
+	if not (id and type(ammo) == "string" and is_loadout_mag(id)) then return false end
+	local data = data_for(id)
+	if not (data and not data.is_weapon and ammo_priority(data.section or magazine, ammo)) then return false end
+	if not commit_assignment(id, data, ammo, nil) then return false end
+	tracked[id], dormant[id] = true, nil
+	if refresh then refresh_inventory(2) end; return true
+end
+local function loadout_size(id, data)
+	if magazine_binder and type(magazine_binder.get_size) == "function" then
+		local ok, value = pcall(magazine_binder.get_size, id, data)
+		if ok and (value == "small" or value == "medium" or value == "large") then return value end
+	end
+	return "small"
+end
+local function capacity(update)
+	if update and type(original.update) == "function" then
+		local ok, err = pcall(original.update)
+		if not ok then log_error("assignment: loadout slot update failed: %s", tostring(err)) end
+	end
+	if not (magazine_binder and type(magazine_binder.get_loadout_size) == "function") then return nil end
+	local ok, value = pcall(magazine_binder.get_loadout_size)
+	if not (ok and type(value) == "table") then return nil end
+	local result = {}
+	for _, size in ipairs({ "small", "medium", "large" }) do
+		result[size] = math.max(0, math.floor(tonumber(value[size]) or 0))
+	end
+	return result
+end
+local function capacity_key(value)
+	return value and table.concat({ value.small, value.medium, value.large }, ":") or nil
+end
+local function id_before(a, b)
+	local an, bn = tonumber(a), tonumber(b)
+	if an and bn then return an < bn end
+	return tostring(a) < tostring(b)
+end
+local function sorted_keys(value)
+	local ids = {}
+	for id in pairs(value or {}) do ids[#ids + 1] = id end
+	table.sort(ids, id_before)
+	return ids
+end
+local function ordered_before(a, b)
+	if a.order ~= b.order then return a.order < b.order end
+	return id_before(a.id, b.id)
+end
+local function collect_desired_loose()
+	local result = { small = {}, medium = {}, large = {} }
+	local actor = db and db.actor
+	if not actor then return result end
+	pcall(function()
+		actor:iterate_inventory(function(_, magazine)
+			local id = object_id(magazine)
+			local data = id and data_for(id) or nil
+			local order = loadout_order(data)
+			if not (order and data and not data.is_weapon) then return end
+			local size = loadout_size(id, data)
+			result[size][#result[size] + 1] = { id = id, order = order }
+		end)
+	end)
+	for _, size in ipairs({ "small", "medium", "large" }) do table.sort(result[size], ordered_before) end
+	return result
+end
+local function layout_blocked()
+	if magazines and type(magazines.action_in_progress) == "function" then
+		local ok, busy = pcall(magazines.action_in_progress)
+		if ok and busy then return true end
+	end
+	local aml = core.service("aml")
+	if aml and type(aml.active) == "function" then
+		local ok, busy = pcall(aml.active)
+		if ok and busy then return true end
+	end
+	return false
+end
+local function refresh_mag_hud()
+	if mag_hud and mag_hud.HUD and type(mag_hud.HUD.Update) == "function" then
+		pcall(mag_hud.HUD.Update, mag_hud.HUD, true)
+	end
+end
+local repack
+repack = function(refresh, slots_current)
+	if layout_running or not (original.toggle and magazine_binder and
+		type(magazine_binder.get_carried_mags) == "function") then return false end
+	if layout_blocked() then layout_dirty = true return false end
+	layout_running = true
+	local slots = capacity(not slots_current)
+	if not slots then layout_running = false return false end
+	local desired, selected, sequence = collect_desired_loose(), {}, {}
+	local free = { small = slots.small, medium = slots.medium, large = slots.large }
+	local function allocate(entry, choices)
+		for i = 1, #choices do
+			local slot = choices[i]
+			if free[slot] > 0 then
+				free[slot] = free[slot] - 1
+				selected[entry.id], sequence[#sequence + 1] = true, entry.id
+				return
+			end
+		end
+	end
+	-- Physical size always wins; add order only breaks ties within one size.
+	for _, entry in ipairs(desired.large) do allocate(entry, { "large" }) end
+	for _, entry in ipairs(desired.medium) do allocate(entry, { "medium", "large" }) end
+	for _, entry in ipairs(desired.small) do allocate(entry, { "small", "medium", "large" }) end
+	local carried, changed = {}, false
+	pcall(magazine_binder.get_carried_mags, carried)
+	for id in pairs(carried) do
+		if not selected[id] then
+			local ok = pcall(original.toggle, id)
+			if ok then changed = true end
+		end
+	end
+	for i = 1, #sequence do
+		local id = sequence[i]
+		if not is_carried(id) then
+			local ok, result = pcall(original.toggle, id)
+			if ok and (result == true or is_carried(id)) then changed = true
+			else log_error("assignment: could not equip selected magazine | id=%s", tostring(id)) end
+		end
+	end
+	layout_signature, layout_dirty, layout_running = capacity_key(slots), false, false
+	if changed then
+		if refresh then refresh_inventory(2) end
+		refresh_mag_hud()
+	end
+	return changed
+end
+-- Drains a pending sweep and nothing else: a layout that is dirty without a
+-- request keeps waiting for its own reader or for reconcile.
+local function drain_repack()
+	if not repack_requested then return end
+	repack_requested = false
+	if layout_dirty then repack(false) end
+end
+-- Forces the sweep for a reader that needs a packed layout now.  repack
+-- re-checks layout_running, so a reader reached from inside one is a no-op.
+local function ensure_layout()
+	repack_requested = false
+	if not layout_running and layout_dirty then repack(false) end
+end
+function add_loadout_mag(value, refresh)
+	local id = object_id(value)
+	local data = id and data_for(id) or nil
+	if not (id and data and not data.is_weapon and actor_owned(id) ~= false) then return nil end
+	if not loadout_order(data) then
+		data[LOADOUT_KEY] = allocate_order()
+		if not commit(id, data) then return nil end
+	end
+	tracked[id] = true; layout_dirty = true; repack(refresh ~= false)
+	return true
+end
+-- Fail-closed ownership seam for the AML bridge.  A generated magazine that
+-- cannot be reinserted remains the same actor-owned object and keeps its
+-- loadout order, exact round stack, and current assignment.  Loose magazines
+-- never keep a weapon-slot tag; repack independently decides whether capacity
+-- equips this selected loadout member.
+function preserve_loose(id, expected, preferred)
+	if not (id and type(expected) == "table" and type(expected.loaded) == "table") then
+		return false, "missing expected loose magazine record"
+	end
+	local owned = actor_owned(id)
+	if owned == nil then return nil, "generated magazine ownership is not observable yet" end
+	if not owned then return false, "generated magazine is no longer actor-owned" end
+	local current = data_for(id)
+	if not (type(current) == "table" and not current.is_weapon and
+		current.section == expected.section and type(current.loaded) == "table") then
+		return false, "generated magazine binder is not the expected loose record"
+	end
+	local order = loadout_order(expected) or loadout_order(current)
+	if not order then return false, "generated magazine lost its loadout order" end
+	if preferred and not ammo_priority(current.section, preferred) then
+		return false, "generated magazine assignment is no longer compatible"
+	end
+	local restored = copy_value(expected)
+	restored.is_weapon, restored[SLOT_KEY], restored[LOADOUT_KEY] = false, nil, order
+	restored[AMMO_KEY] = preferred
+	if not core.deep_equal(current, restored) and not commit(id, restored) then
+		return false, "could not restore generated magazine binder"
+	end
+	current = data_for(id)
+	if not (type(current) == "table" and not current.is_weapon and current.section == restored.section and
+		type(current.loaded) == "table" and core.deep_equal(current.loaded, restored.loaded) and
+		loadout_order(current) == order and embedded(current) == preferred and current[SLOT_KEY] == nil) then
+		return false, "generated magazine loose invariant did not verify"
+	end
+	index(id, current)
+	layout_dirty = true
+	repack(false)
+	return true
+end
+function remove_loadout_mag(value, refresh)
+	local id = object_id(value)
+	if not id or not is_loadout_mag(id) then return nil end
+	if not forget(id, false) then return nil end
+	repack(refresh ~= false)
+	return true
+end
+function toggle_loadout_mag(value, refresh)
+	local id = object_id(value)
+	if not id then return nil end
+	if is_loadout_mag(id) then return remove_loadout_mag(id, refresh) and false or nil end
+	return add_loadout_mag(id, refresh)
+end
+local function classify_weapon_scope(id, data, current_slot)
+	if loadout_order(data) then
+		local slot = type(current_slot) == "number" and current_slot or
+			normalize_slot(data[SLOT_KEY]) or normalize_slot(dormant[id]) or UNKNOWN_SLOT
+		return slot, type(current_slot) == "number"
+	end
+	if type(current_slot) == "number" then return current_slot, true end
+	return normalize_slot(data[SLOT_KEY]) or normalize_slot(dormant[id]) or UNKNOWN_SLOT, false
+end
+local resolve_transition
+local function transition(source_id, kind, target_id, preferred, context)
+	if not source_id then source_id = "target:" .. tostring(target_id) end
+	local old = transitions[source_id]
+	if old and old.target_id then target_sources[old.target_id] = nil end
+	transitions[source_id] = nil
+	if not kind then return old ~= nil end
+	local record = { kind = kind, target_id = target_id, preferred = preferred,
+		order = context and context.order,
+		slot = context and context.slot, deadline = now_ms() + TRANSFER_TIMEOUT,
+		attempts = 0 }
+	transitions[source_id] = record
+	if target_id then target_sources[target_id] = source_id end
+	if CreateTimeEvent then
+		local action = "transfer_" .. tostring(source_id)
+		if RemoveTimeEvent then RemoveTimeEvent(EVENT_GROUP, action) end
+		CreateTimeEvent(EVENT_GROUP, action, 0, function(id) return resolve_transition(id, true) end, source_id)
+	end
+	return record
+end
+resolve_transition = function(source_id, wait)
+	local record = transitions[source_id]
+	if not record then return true end
+	record.attempts = record.attempts + 1
+	local id = record.target_id
+	local data = id and data_for(id) or nil
+	local expired = now_ms() >= record.deadline or record.attempts >= TRANSFER_ATTEMPTS
+	if id and type(data) == "table" and actor_owned(id) ~= false then
+		local changed = false
+		if record.order and loadout_order(data) ~= record.order then
+			data[LOADOUT_KEY], changed = record.order, true
+		end
+		if data.is_weapon then
+			local slot = normalize_slot(record.slot) or normalize_slot(data[SLOT_KEY]) or UNKNOWN_SLOT
+			if data[SLOT_KEY] ~= slot then data[SLOT_KEY], changed = slot, true end
+		else
+			if data[SLOT_KEY] ~= nil then data[SLOT_KEY], changed = nil, true end
+		end
+		if record.preferred and ammo_priority(data.section, record.preferred) then
+			if embedded(data) ~= record.preferred then data[AMMO_KEY], changed = record.preferred, true end
+		elseif data[AMMO_KEY] ~= nil then data[AMMO_KEY], changed = nil, true end
+		if changed and not commit(id, data) then
+			if not expired then return false end
+		else
+			local stored = data_for(id) or data
+			local order_ok = not record.order or loadout_order(stored) == record.order
+			local ammo_ok = not record.preferred or not ammo_priority(stored.section, record.preferred) or
+				embedded(stored) == record.preferred
+			if order_ok and ammo_ok then
+				-- An ejection is keyed by the persistent weapon ID. By the time
+				-- its generated magazine is initialized, a different incoming
+				-- magazine may already occupy that same binder ID. The native
+				-- ejection path and on_record_transfer("eject") already stripped
+				-- the outgoing record, so never clear the reused source here.
+				if record.kind ~= "eject" and source_id ~= id and type(source_id) ~= "string" then
+					forget(source_id, false)
+				end
+				index(id, stored); transition(source_id)
+				layout_dirty = true; repack(false)
+				return true
+			end
+			if not expired then return false end
+		end
+	end
+	if not wait or actor_owned(id) == false or expired then
+		log_error("assignment: loadout transfer expired | kind=%s | source_id=%s | target_id=%s",
+			tostring(record.kind), tostring(source_id), tostring(id))
+		transition(source_id)
+		return true
+	end
+	return false
+end
+-- Transfer seam shared by core, Reload, retool, and disassembly hooks.
+function on_record_transfer(kind, source_id, target_id, snapshot, context)
+	context = type(context) == "table" and context or {}
+	local source = type(snapshot) == "table" and copy_value(snapshot) or data_for(source_id)
+	local preferred, target = embedded(source) or context.preferred, target_id and data_for(target_id) or nil
+	local order = loadout_order(source) or loadout_order(context) or tonumber(context.order)
+	if not order and (preferred or context.source_live) then order = allocate_order() end
+	if not (order or preferred) then
+		if source_id then index(source_id, nil) end
+		return false
+	end
+	context.order = order
+	local cloning = kind == "clone" or kind == "wpo_clone" or kind == "attachment_clone"
+	if kind == "load" or cloning then
+		if cloning then
+			target = target or (source and copy_value(source))
+			if target then target.is_weapon = true end
+		else index(source_id, nil) end
+		if not (target and target.is_weapon) then return false end
+		local slot = cloning and (normalize_slot(context.slot) or loaded_slot(target_id) or
+			normalize_slot(source and source[SLOT_KEY]) or UNKNOWN_SLOT) or loaded_slot(target_id)
+		target[LOADOUT_KEY], target[SLOT_KEY] = order, normalize_slot(slot) or UNKNOWN_SLOT
+		if preferred and ammo_priority(target.section, preferred) then target[AMMO_KEY] = preferred
+		else target[AMMO_KEY] = nil end
+		if not commit(target_id, target) then return false end
+		if source_id ~= target_id then forget(source_id, false) end
+		tracked[target_id] = true
+		if cloning then
+			if type(slot) == "number" and loaded_slot(target_id) == slot then dormant[target_id] = nil
+			else dormant[target_id] = slot end
+		else dormant[target_id] = nil end
+		layout_dirty = true; repack(false)
+		return true
+	end
+	if kind == "eject" then
+		-- Mags removes a retained chamber round from its live mag_data before the
+		-- zero-delay timer writes the generated object. Stage only the ID/preference
+		-- here; committing the pre-ejection snapshot would briefly restore that round.
+		index(source_id, nil)
+		return target_id and transition(source_id, kind, target_id, preferred, context) ~= nil or false
+	end
+	if kind ~= "disassembly" and kind ~= "retool" then return false end
+	if not target_id then return false end
+	target = target or copy_value(source) or {}
+	target.loaded = type(target.loaded) == "table" and target.loaded or {}
+	target.section = context.target_section or target.section or (source and source.section)
+	target.is_weapon, target[SLOT_KEY], target[LOADOUT_KEY] = false, nil, order
+	if not (preferred and ammo_priority(target.section, preferred)) then preferred = nil end
+	if not commit_assignment(target_id, target, preferred, nil) then return false end
+	tracked[target_id] = true
+	local pending = transition(source_id, kind, target_id, preferred, context)
+	resolve_transition(source_id, false)
+	return pending ~= nil
+end
+function before_eject(weapon)
+	local id = object_id(weapon)
+	local data = data_for(id)
+	return { source_id = id, snapshot = data and copy_value(data) or nil,
+		preferred = read(id, data), order = loadout_order(data), slot = loaded_slot(id) }
+end
+function after_eject(weapon, token, ok, new_id)
+	if not (ok and type(token) == "table" and token.source_id and new_id and (token.order or token.preferred)) then return false end
+	local after = data_for(token.source_id)
+	local before = token.snapshot
+	local removed = before and before.is_weapon and before.section ~= "no_mag" and
+		(not after or not after.is_weapon or after.section == "no_mag")
+	if not removed then return false end
+	return on_record_transfer("eject", token.source_id, new_id, before,
+		{ preferred = token.preferred, order = token.order, slot = token.slot, source_live = true })
+end
+function after_timer_eject(weapon_id, new_id, mag_data, ok)
+	if ok == false then return false end
+	local source_id = target_sources[new_id]
+	if source_id then return resolve_transition(source_id, false) end
+	local data = data_for(new_id) or mag_data
+	if loadout_order(data) then
+		index(new_id, data); layout_dirty = true; repack(false)
+		return read(new_id, data) ~= nil
+	end
+	return false
+end
+function before_load_weapon(weapon, magazine)
+	local weapon_id, magazine_id = object_id(weapon), object_id(magazine)
+	local source = data_for(magazine_id)
+	return { weapon_id = weapon_id, magazine_id = magazine_id,
+		weapon_before = copy_value(data_for(weapon_id)), snapshot = source and copy_value(source) or nil,
+		preferred = read(magazine_id, source), order = loadout_order(source),
+		source_live = is_loadout_mag(magazine_id, source) }
+end
+function after_load_weapon(weapon, magazine, token, ok)
+	if not (ok and type(token) == "table" and (token.order or token.preferred)) then return false end
+	local source_gone = not data_for(token.magazine_id) and not is_carried(token.magazine_id)
+	local target = data_for(token.weapon_id)
+	local was_empty = not token.weapon_before or not token.weapon_before.is_weapon or
+		token.weapon_before.section == "no_mag"
+	if not (source_gone and was_empty and target and target.is_weapon and target.section ~= "no_mag") then return false end
+	return on_record_transfer("load", token.magazine_id, token.weapon_id, token.snapshot,
+		{ preferred = token.preferred, order = token.order, source_live = token.source_live })
+end
+-- `exhausted` remains mutable so AML can advance through stacks of the exact assignment.
+local function field_candidates(weapon, allowed_ids, preferred_first)
+	local actor = db and db.actor
+	if not (actor and magazine_binder and type(magazine_binder.is_magazine) == "function") then return {} end
+	if weapon and type(magazine_binder.is_compatible) ~= "function" then return {} end
+	local candidates = {}
+	pcall(function()
+		actor:iterate_inventory(function(_, magazine)
+			local ok, valid = pcall(magazine_binder.is_magazine, magazine)
+			if not (ok and valid) then return end
+			local id = object_id(magazine)
+			if not (id and is_live(id)) or allowed_ids and not allowed_ids[id] then return end
+			if weapon then
+				ok, valid = pcall(magazine_binder.is_compatible, weapon, magazine)
+				if not (ok and valid) then return end
+			end
+			local data = data_for(id)
+			local preferred = data and read(id, data) or nil
+			local priority = preferred and assigned_priority(magazine, preferred) or nil
+			if not (priority and type(data.loaded) == "table") then return end
+			local section = section_of(magazine) or data.section
+			local capacity = tonumber(SYS_GetParam and SYS_GetParam(2, section, "max_mag_size")) or 30
+			local missing = capacity - #data.loaded
+			if missing <= 0 then return end
+			local exhausted = {}
+			local ammo, ammo_section = choose_ammo(priority, exhausted)
+			if not ammo then return end
+			candidates[#candidates + 1] = { magazine = magazine, magazine_id = id,
+				preferred = preferred, priority = priority, ammo = ammo,
+				ammo_section = ammo_section, exhausted = exhausted, capacity = capacity, missing = missing,
+				delay = magazines and type(magazines.get_mag_time) == "function" and
+					magazines.get_mag_time(section, false) or 0.4 }
+		end)
+	end)
+	table.sort(candidates, function(a, b)
+		if preferred_first then
+			local a_first, b_first = a.preferred == preferred_first, b.preferred == preferred_first
+			if a_first ~= b_first then return a_first end
+		end
+		if a.missing ~= b.missing then return a.missing < b.missing end
+		return a.magazine_id < b.magazine_id
+	end)
+	return candidates
+end
+function field_plan(weapon, allowed_ids, preferred_first)
+	ensure_layout()
+	return field_candidates(weapon, allowed_ids, preferred_first)[1]
+end
+local function held_field_candidate(weapon)
+	local weapon_id = object_id(weapon)
+	local slot = weapon_id and loaded_slot(weapon_id) or nil
+	if not (weapon_id and type(slot) == "number") then return nil end
+	local supports = magazines and magazines.is_supported_weapon
+	if type(supports) ~= "function" then return nil end
+	local ok, supported = pcall(supports, weapon)
+	if not (ok and supported) then return nil end
+	local data = data_for(weapon_id)
+	if not (data and data.is_weapon and data.section ~= "no_mag" and type(data.loaded) == "table") then
+		return nil
+	end
+	local preferred = read(weapon_id, data)
+	if not loadout_order(data) then return nil end
+	local priority = preferred and assigned_priority(data.section, preferred) or nil
+	if not priority then return nil end
+	local capacity = tonumber(SYS_GetParam and SYS_GetParam(2, data.section, "max_mag_size")) or 30
+	local physical = #data.loaded
+	if magazines and type(magazines.retain_round) == "function" then
+		local retain_ok, retains = pcall(magazines.retain_round, weapon)
+		local count_ok, engine_count = pcall(function() return weapon:get_ammo_in_magazine() end)
+		if retain_ok and retains and count_ok and tonumber(engine_count) and engine_count > 0 and physical > 0 then
+			physical = physical - 1
+		end
+	end
+	if physical >= capacity then return nil end
+	local exhausted = {}
+	local ammo = choose_ammo(priority, exhausted)
+	if not ammo then return nil end
+	return { weapon_id = weapon_id, weapon_slot = slot, magazine_section = data.section, preferred = preferred }
+end
+function field_snapshot(active_weapon)
+	ensure_layout()
+	local actor = db and db.actor
+	if not actor then return {}, 0, nil end
+	local held = active_weapon and held_field_candidate(active_weapon) or nil
+	local ordered, seen_weapons = {}, {}
+	local function add_weapon(weapon, slot)
+		local id = object_id(weapon)
+		if not id or seen_weapons[id] then return end
+		seen_weapons[id] = true; ordered[#ordered + 1] =
+			{ weapon = weapon, weapon_id = id, weapon_slot = slot }
+	end
+	local active_id = object_id(active_weapon)
+	if active_id then
+		add_weapon(active_weapon, loaded_slot(active_id))
+		if utils_item and type(utils_item.get_ammo) == "function" then
+			local ok, index = pcall(function() return active_weapon:get_ammo_type() end)
+			local list_ok, list = pcall(utils_item.get_ammo, nil, active_id)
+			if ok and list_ok and type(list) == "table" then ordered[1].preferred_ammo =
+				list[(tonumber(index) or -1) + 1] end
+		end
+	end
+	for slot = 1, 3 do
+		local ok, weapon = pcall(function() return actor:item_in_slot(slot) end)
+		if ok and weapon and object_is_weapon(weapon) then add_weapon(weapon, slot) end
+	end
+	local groups, seen_mags, total = {}, {}, 0
+	for i = 1, #ordered do
+		local entry = ordered[i]
+		local candidates = field_candidates(entry.weapon, nil, entry.preferred_ammo)
+		local ids, count = {}, 0
+		for n = 1, #candidates do
+			local id = candidates[n].magazine_id
+			if not seen_mags[id] then ids[id], seen_mags[id], count = true, true, count + 1 end
+		end
+		if count > 0 then
+			entry.weapon, entry.magazine_ids = nil, ids
+			groups[#groups + 1], total = entry, total + count
+		end
+	end
+	-- Equipped pouch magazines remain field-loadable even when no compatible
+	-- weapon is currently slotted.  They are still filtered by is_live().
+	local remaining, ids = field_candidates(nil, nil, nil), {}
+	local count = 0
+	for i = 1, #remaining do
+		local id = remaining[i].magazine_id
+		if not seen_mags[id] then ids[id], seen_mags[id], count = true, true, count + 1 end
+	end
+	if count > 0 then
+		groups[#groups + 1], total = { magazine_ids = ids, weapon_slot = 0 }, total + count
+	end
+	return groups, total + (held and 1 or 0), held
+end
+local function note_dormant(id, data)
+	local slot = loaded_slot(id)
+	if type(slot) == "number" then dormant[id] = nil
+	else dormant[id] = normalize_slot(data[SLOT_KEY]) or UNKNOWN_SLOT end
+end
+local function wrapped_set_data(id, data, ...)
+	local before = data_for(id)
+	if type(data) == "table" then
+		local preferred = embedded(data)
+		local selected = loadout_order(data)
+		if data.is_weapon and data.section ~= "no_mag" and selected then
+			if preferred then
+				local slot = loaded_slot(id)
+				if type(slot) == "number" then data[SLOT_KEY] = slot end
+			elseif data[AMMO_KEY] ~= nil then data[AMMO_KEY] = nil end
+		else
+			data[SLOT_KEY] = nil
+			if data.is_weapon or not selected then data[LOADOUT_KEY], data[AMMO_KEY] = nil, nil
+			elseif data[AMMO_KEY] ~= nil and not preferred then data[AMMO_KEY] = nil end
+		end
+	end
+	local results = pack(original.set_data(id, data, ...))
+	if type(data) == "table" then index(id, data)
+		if data.is_weapon and loadout_order(data) then note_dormant(id, data) end
+	else index(id, nil) end
+	if loadout_order(before) ~= loadout_order(data) or
+		type(before) == "table" and type(data) == "table" and
+		(before.section ~= data.section or before.is_weapon ~= data.is_weapon) then layout_dirty = true end
+	return unpack(results, 1, results.n)
+end
+local function wrapped_room(...)
+	ensure_layout()
+	return original.room(...)
+end
+local function wrapped_update(...)
+	local results = type(original.update) == "function" and pack(original.update(...)) or { n = 0 }
+	layout_dirty = true; repack(true, true)
+	return unpack(results, 1, results.n)
+end
+local function wrapped_retain(id, ...)
+	local data = data_for(id)
+	local source = target_sources[id]
+	if loadout_order(data) or source and transitions[source] and transitions[source].order then return true end
+	return original.retain(id, ...)
+end
+-- The object's ID when Mags' binder says it is a magazine, else nil.
+local function magazine_id(obj)
+	if not (obj and magazine_binder and type(magazine_binder.is_magazine) == "function") then return nil end
+	local ok, valid = pcall(magazine_binder.is_magazine, obj)
+	return ok and valid and object_id(obj) or nil
+end
+local function wrapped_loadout_precondition(obj)
+	local id = magazine_id(obj)
+	local equipped = id and is_loadout_mag(id) or false
+	return id and translate(equipped and "st_mag_loadout_remove" or "st_mag_loadout_add",
+		equipped and "Remove from loadout" or "Add to loadout")
+end
+local function wrapped_loadout_func(obj)
+	if toggle_loadout_mag(obj, true) ~= nil then refresh_mag_hud() end
+end
+local BINDER_HOOKS = { "set_data", "toggle_carried_mag", "validate_loadout", "room_in_pouch" }
+local function install_binder_hooks()
+	if hooks.binder then return true end
+	if magazine_binder and magazine_binder.__mags_assignment_service_scope then hooks.binder = true return true end
+	local missing = core.missing_member(magazine_binder, "magazine_binder", BINDER_HOOKS)
+	if missing then
+		log_error("assignment: binder/loadout hooks unavailable")
+		for i = 1, #BINDER_HOOKS do core.record_seam("magazine_binder." .. BINDER_HOOKS[i], missing) end
+		return false
+	end
+	for i = 1, #BINDER_HOOKS do core.record_seam("magazine_binder." .. BINDER_HOOKS[i], nil) end
+	original.set_data, original.toggle = magazine_binder.set_data, magazine_binder.toggle_carried_mag
+	original.room = magazine_binder.room_in_pouch
+	original.update = magazine_binder.update_loadout_slots
+	original.retain = magazines and magazines.retain_magazine
+	magazine_binder.set_data, magazine_binder.toggle_carried_mag = wrapped_set_data, toggle_loadout_mag
+	magazine_binder.validate_loadout, magazine_binder.room_in_pouch = wrapped_update, wrapped_room
+	if type(original.update) == "function" then magazine_binder.update_loadout_slots = wrapped_update end
+	core.record_seam("magazine_binder.update_loadout_slots",
+		type(original.update) ~= "function" and "magazine_binder.update_loadout_slots" or nil)
+	magazine_binder.__mags_assignment_service_scope = BUILD
+	-- Mags modules cache these globals during module load. Rebind every known
+	-- removal-capable alias, including Alt-click and pouch-capacity paths.
+	-- binds is an ordered list of { member, wrapper } pairs; an alias the host
+	-- does not define is reported and stays absent.
+	local bind_cached = function(host, host_name, binds)
+		for i = 1, #binds do
+			local name, wrapped = binds[i][1], binds[i][2]
+			local missing = core.missing_member(host, host_name, { name })
+			core.record_seam(host_name .. "." .. name, missing)
+			if not missing then host[name] = wrapped end
+		end
+	end
+	-- magazines.toggle_carried_mag is deliberately left native so the
+	-- controller's exact held-mag room override can mutate the active table.
+	bind_cached(magazines, "magazines", { { "set_mag_data", wrapped_set_data }, { "room_in_pouch", wrapped_room },
+		{ "loadout_precondition", wrapped_loadout_precondition }, { "loadout_func", wrapped_loadout_func } })
+	if magazines and type(original.retain) == "function" then magazines.retain_magazine = wrapped_retain end
+	core.record_seam("magazines.retain_magazine", core.missing_member(magazines, "magazines", { "retain_magazine" }))
+	bind_cached(mags_patches, "mags_patches", { { "set_data", wrapped_set_data },
+		{ "toggle_carried_mag", toggle_loadout_mag }, { "room_in_pouch", wrapped_room },
+		{ "is_carried_mag", is_loadout_mag } })
+	bind_cached(magazines_loot, "magazines_loot", { { "set_data", wrapped_set_data } })
+	hooks.binder = true
+	return true
+end
+translate = function(id, fallback)
+	if game and type(game.translate_string) == "function" then
+		local ok, value = pcall(game.translate_string, id)
+		if ok and value and value ~= id then return value end
+	end
+	return fallback
+end
+local function ammo_name(section)
+	if not section then return nil end
+	if ui_item and type(ui_item.get_sec_short_name) == "function" then
+		local ok, value = pcall(ui_item.get_sec_short_name, section)
+		if ok and value then return value end
+	end
+	local key = SYS_GetParam and (SYS_GetParam(0, section, "inv_name_short") or
+		SYS_GetParam(0, section, "inv_name"))
+	return key and translate(key, tostring(section)) or tostring(section)
+end
+local function wrapped_description(obj, str)
+	local base = original.description(obj, str)
+	local id = magazine_id(obj)
+	if not (id and is_loadout_mag(id)) then return base end
+	local preferred = read(id)
+	if not preferred then return base end
+	local dot = translate("st_dot", "-")
+	local label = utils_xml and utils_xml.get_color and utils_xml.get_color("pda_white") or ""
+	local value = utils_xml and utils_xml.get_color and utils_xml.get_color("d_cyan") or ""
+	return tostring(base or "") .. "\\n " .. dot .. " " .. label ..
+		translate("ui_mags_aml_assignment_prefix", "Assigned ammo:") .. " " ..
+		value .. ammo_name(preferred) .. " \\n"
+end
+-- optional_host: an absent host is not reported (its mod is simply not
+-- installed); a present host without the member always is.
+local function install_hook(key, host, host_name, name, wrapped, optional_host)
+	if hooks[key] then return true end
+	local marker = "__mags_assignment_service_" .. key
+	if host and host[marker] then hooks[key] = true return true end
+	if not (host and type(host[name]) == "function") then
+		if host ~= nil or not optional_host then
+			core.record_seam(host_name .. "." .. name, core.missing_member(host, host_name, { name }))
+		end
+		return false
+	end
+	original[key], host[name], host[marker], hooks[key] = host[name], wrapped, BUILD, true
+	core.record_seam(host_name .. "." .. name, nil)
+	return true
+end
+local function assignment_functor(mode, magazine, index)
+	local choice = choices(magazine)[index]
+	if not choice then return mode == "condition" and false or nil end
+	if mode == "label" then
+		local format = translate("ui_mags_aml_assign_action", "Assign: %s")
+		local ok, value = pcall(string.format, format, ammo_name(choice))
+		return ok and value or format
+	end
+	local id = magazine_id(magazine)
+	local actionable = id and is_loadout_mag(id) and read(id) ~= choice or false
+	if mode == "condition" then return actionable end
+	if actionable then write(id, magazine, choice, true) end
+end
+local function register_functors()
+	if functors_registered then return true end
+	if not (custom_functor_autoinject and type(custom_functor_autoinject.add_functor) == "function") then
+		log_error("assignment: assignment context actions unavailable"); return false
+	end
+	for index = 1, 8 do
+		local choice_index = index
+		local condition = function(magazine) return assignment_functor("condition", magazine, choice_index) end
+		local label = function(magazine) return assignment_functor("label", magazine, choice_index) end
+		local action = function(magazine) assignment_functor("action", magazine, choice_index) end
+		local ok, err = pcall(custom_functor_autoinject.add_functor,
+			"mags_aml_assign_ammo_" .. tostring(index), condition, label, condition, action, false)
+		if not ok then log_error("assignment: assignment action %s failed: %s", tostring(index), tostring(err)) return false end
+	end
+	functors_registered = true; return true
+end
+local function convert_record(kind, obj, obj_d, target, args)
+	local source_id = object_id(obj)
+	local snapshot = copy_value(data_for(source_id)); local preferred = read(source_id, snapshot)
+	local order = loadout_order(snapshot)
+	local source_live = is_loadout_mag(source_id, snapshot)
+	local wanted = kind == "retool" and target or (order or preferred) and snapshot and snapshot.section
+	local create_item, created = _G.alife_create_item, nil
+	if wanted and type(create_item) == "function" then
+		_G.alife_create_item = function(section, parent, ...)
+			local result = create_item(section, parent, ...)
+			if not created and section == wanted then created = result end
+			return result
+		end
+	end
+	local results = pack(pcall(function()
+		if kind == "retool" then return original.retool(obj, unpack(args, 1, args.n)) end
+		local support = mag_support
+		if support then return core.scoped_override(support, "eject_mag", support.eject_mag,
+			original.disassembly, obj, obj_d, unpack(args, 1, args.n)) end
+		return original.disassembly(obj, obj_d, unpack(args, 1, args.n))
+	end))
+	if wanted and type(create_item) == "function" then _G.alife_create_item = create_item end
+	if not results[1] then error(results[2], 0) end
+	local target_id = object_id(created)
+	if wanted and target_id then
+		on_record_transfer(kind, source_id, target_id, snapshot,
+			{ preferred = preferred, order = order, source_live = source_live, target_section = wanted })
+		-- The base disassembly patch owns a cached native toggle and schedules it
+		-- after returning.  Reproject once that callback has run so it cannot
+		-- leave a selected generated magazine inactive by toggling it twice.
+		if kind == "disassembly" and CreateTimeEvent then
+			CreateTimeEvent(EVENT_GROUP, "post_disassembly_" .. tostring(target_id), 0.05, function()
+				layout_dirty = true; repack(false); return true
+			end)
+		end
+	end
+	return unpack(results, 2, results.n)
+end
+local function wrapped_retool(magazine, ...)
+	local target
+	if magazine and magazine_binder and type(magazine_binder.get_retool_section) == "function" then
+		local ok, value = pcall(magazine_binder.get_retool_section, magazine)
+		if ok then target = value end
+	end
+	if not target then return original.retool(magazine, ...) end
+	return convert_record("retool", magazine, nil, target, pack(...))
+end
+local function wrapped_disassembly(obj, obj_d, ...)
+	return convert_record("disassembly", obj, obj_d, nil, pack(...))
+end
+function reconcile(refresh)
+	-- Three exact slot reads once per reconciliation keep spawned/default
+	-- inserted magazines discoverable even when an equip path bypasses the
+	-- ordinary inventory callback. Loose inventory magazines are not scanned.
+	local actor = db and db.actor
+	if actor then
+		for slot = 1, 3 do
+			pcall(function()
+				local id = object_id(actor:item_in_slot(slot))
+				adopt_slotted(id, id and data_for(id) or nil)
+			end)
+		end
+	end
+	local carried = {}
+	if magazine_binder and type(magazine_binder.get_carried_mags) == "function" then
+		pcall(magazine_binder.get_carried_mags, carried)
+	end
+	local changed = 0
+	local active_ids = sorted_keys(carried)
+	for i = 1, #active_ids do
+		local id = active_ids[i]
+		local data = data_for(id) or carried[id]
+		if type(data) == "table" and not data.is_weapon and not loadout_order(data) then
+			data[LOADOUT_KEY] = allocate_order()
+			if commit(id, data) then changed = changed + 1 end
+		end
+		if loadout_order(data) then tracked[id] = true end
+	end
+	local ids = {}
+	for id in pairs(tracked) do ids[#ids + 1] = id end
+	for i = 1, #ids do
+		local id, data = ids[i], data_for(ids[i])
+		if not data then index(id, nil) changed = changed + 1
+		elseif actor_owned(id) == false and not target_sources[id] then
+			if forget(id, false, data) then changed = changed + 1 end
+		elseif not loadout_order(data) and embedded(data) then
+			data[LOADOUT_KEY] = allocate_order()
+			if commit(id, data) then tracked[id], changed = true, changed + 1 end
+		elseif data.is_weapon then
+			local valid = read(id, data) ~= nil
+			local current_slot = nil
+			if valid and equipment_ready then current_slot = loaded_slot(id) end
+			if valid then
+				local slot, equipped = classify_weapon_scope(id, data, current_slot)
+				if data[SLOT_KEY] ~= slot then data[SLOT_KEY] = slot commit(id, data) end
+				if equipped then dormant[id] = nil else dormant[id] = slot end
+			end
+			if not valid then changed = changed + 1 end
+		elseif not read(id, data) then changed = changed + 1 end
+	end
+	local sources = {}
+	for source_id in pairs(transitions) do sources[#sources + 1] = source_id end
+	for i = 1, #sources do resolve_transition(sources[i], true) end
+	local slots = capacity(false)
+	if capacity_key(slots) ~= layout_signature then layout_dirty = true end
+	if layout_dirty then repack(false, true) end
+	if refresh and changed > 0 then refresh_inventory(2) end
+	return changed
+end
+local function record_scope(id, data)
+	if type(data) ~= "table" or not loadout_order(data) then return false end
+	if actor_owned(id) == false then return false end
+	if not data.is_weapon then return true, nil end
+	local scoped = classify_weapon_scope(id, data, loaded_slot(id))
+	return true, scoped
+end
+function on_load_state(mdata)
+	tracked, dormant, transitions, target_sources, equipment_ready = {}, {}, {}, {}, false
+	if type(mdata) ~= "table" then return end
+	next_loadout_order = math.max(1, math.floor(tonumber(mdata[NEXT_ORDER_KEY]) or 1))
+	local carried = type(mdata.carried_mags) == "table" and mdata.carried_mags or {}
+	local storage = type(mdata.mags_storage) == "table" and mdata.mags_storage or {}
+	local old_loose = type(mdata[LEGACY_LOOSE_KEY]) == "table" and mdata[LEGACY_LOOSE_KEY] or {}
+	local old_loaded = type(mdata[LEGACY_LOADED_KEY]) == "table" and mdata[LEGACY_LOADED_KEY] or {}
+	local migrated_loose, migrated_loaded, migrated_loadout, scrubbed = 0, 0, 0, 0
+	local function store(id, data)
+		storage[id] = data; if carried[id] ~= nil then carried[id] = data end
+		commit(id, data)
+	end
+	-- Observe every existing token before allocating any migrated order.
+	for _, data in pairs(storage) do if loadout_order(data) then observe_order(data[LOADOUT_KEY]) end end
+	local function select(data)
+		if not loadout_order(data) then data[LOADOUT_KEY] = allocate_order(); migrated_loadout = migrated_loadout + 1 end
+		observe_order(data[LOADOUT_KEY])
+	end
+	local legacy_loose_ids = sorted_keys(old_loose)
+	for i = 1, #legacy_loose_ids do
+		local id, preferred = legacy_loose_ids[i], old_loose[legacy_loose_ids[i]]
+		local data = storage[id] or carried[id]
+		local valid = type(data) == "table" and not data.is_weapon and carried[id] and
+			type(preferred) == "string" and ammo_priority(data.section, preferred)
+		if valid then
+			select(data)
+			if not embedded(data) then data[AMMO_KEY] = preferred end
+			data[SLOT_KEY] = nil; store(id, data); migrated_loose = migrated_loose + 1
+		end
+	end
+	local legacy_loaded_ids = sorted_keys(old_loaded)
+	for i = 1, #legacy_loaded_ids do
+		local id, record = legacy_loaded_ids[i], old_loaded[legacy_loaded_ids[i]]
+		local data = storage[id]
+		local preferred = type(record) == "table" and (record.ammo or record.ammo_section)
+		local mag_section = type(record) == "table" and (record.mag_section or record.section)
+		local current_section
+		if level and type(level.object_by_id) == "function" then
+			local ok, obj = pcall(level.object_by_id, id)
+			if ok and obj then current_section = section_of(obj) end
+		end
+		if not current_section and alife_object then
+			local ok, se = pcall(alife_object, id)
+			if ok and se then current_section = section_of(se) end
+		end
+		local current_parent = type(current_section) == "string" and current_section or nil
+		if current_parent and SYS_GetParam then
+			local ok, parent = pcall(SYS_GetParam, 0, current_section, "parent_section", current_section)
+			if ok and type(parent) == "string" then current_parent = parent end
+		end
+		local saved_parent = type(record) == "table" and record.weapon_parent
+		local valid = type(data) == "table" and data.is_weapon and data.section == mag_section and
+			type(preferred) == "string" and ammo_priority(data.section, preferred) and
+			(not current_parent or not saved_parent or current_parent == saved_parent)
+		if valid then
+			select(data)
+			if not embedded(data) then data[AMMO_KEY] = preferred end
+			data[SLOT_KEY] = normalize_slot(data[SLOT_KEY]) or normalize_slot(record.weapon_slot) or UNKNOWN_SLOT
+			store(id, data); migrated_loaded = migrated_loaded + 1
+		end
+	end
+	local active_ids = sorted_keys(carried)
+	for i = 1, #active_ids do
+		local id = active_ids[i]
+		local data = storage[id] or carried[id]
+		if type(data) == "table" and not data.is_weapon then select(data); data[SLOT_KEY] = nil; store(id, data) end
+	end
+	local selected_ids, seen_orders = {}, {}
+	for id, data in pairs(storage) do
+		if type(data) == "table" then
+			if loadout_order(data) then observe_order(data[LOADOUT_KEY]) end
+			if not loadout_order(data) and data.is_weapon and embedded(data) then select(data) end
+			if loadout_order(data) then selected_ids[#selected_ids + 1] = id end
+		end
+	end
+	table.sort(selected_ids, function(a, b)
+		local ao, bo = loadout_order(storage[a]), loadout_order(storage[b])
+		if ao ~= bo then return ao < bo end
+		return id_before(a, b)
+	end)
+	for i = 1, #selected_ids do
+		local id, data = selected_ids[i], storage[selected_ids[i]]
+		local order = loadout_order(data)
+		if seen_orders[order] then data[LOADOUT_KEY] = allocate_order(); migrated_loadout = migrated_loadout + 1
+		else seen_orders[order] = true end
+		if data.is_weapon then
+			data[SLOT_KEY] = normalize_slot(data[SLOT_KEY]) or UNKNOWN_SLOT
+			dormant[id] = data[SLOT_KEY]
+		else data[SLOT_KEY] = nil end
+		if data[AMMO_KEY] ~= nil and not embedded(data) then data[AMMO_KEY] = nil end
+		tracked[id] = true; store(id, data)
+	end
+	for id, data in pairs(storage) do
+		if type(data) == "table" and not loadout_order(data) and
+			(data[AMMO_KEY] ~= nil or data[SLOT_KEY] ~= nil) then
+			data[AMMO_KEY], data[SLOT_KEY] = nil, nil; scrubbed = scrubbed + 1; store(id, data)
+		end
+		if carried[id] ~= nil and type(data) == "table" then carried[id] = data end
+	end
+	mdata.mags_storage, mdata.carried_mags, mdata[NEXT_ORDER_KEY] = storage, carried, next_loadout_order
+	mdata[LEGACY_LOOSE_KEY], mdata[LEGACY_LOADED_KEY] = nil, nil
+	layout_dirty, layout_signature = true, nil
+	if migrated_loose > 0 or migrated_loaded > 0 or migrated_loadout > 0 or scrubbed > 0 then
+		log_info("assignment: save migration | loose=%s | loaded=%s | loadout=%s | scrubbed=%s",
+			tostring(migrated_loose), tostring(migrated_loaded), tostring(migrated_loadout), tostring(scrubbed))
+	end
+end
+function on_save_state(mdata)
+	if type(mdata) ~= "table" then return end
+	reconcile(false)
+	local source_storage = type(mdata.mags_storage) == "table" and mdata.mags_storage or {}
+	local source_carried = type(mdata.carried_mags) == "table" and mdata.carried_mags or {}
+	local storage, carried = {}, {}
+	local function snapshot(id, raw, reuse)
+		local data = reuse and raw or copy_value(raw)
+		if type(data) == "table" then
+			if not loadout_order(data) and data.is_weapon and embedded(data) then
+				data[LOADOUT_KEY] = allocate_order()
+			end
+			local keep, slot = record_scope(id, data)
+			data[SLOT_KEY] = slot
+			if not keep then data[LOADOUT_KEY], data[AMMO_KEY], data[SLOT_KEY] = nil, nil, nil end
+		end
+		return data
+	end
+	for id, raw in pairs(source_storage) do storage[id] = snapshot(id, raw) end
+	for id, raw in pairs(source_carried) do
+		local data = snapshot(id, storage[id] or raw, storage[id] ~= nil)
+		storage[id], carried[id] = storage[id] or data, data
+	end
+	mdata.mags_storage, mdata.carried_mags, mdata[NEXT_ORDER_KEY] = storage, carried, next_loadout_order
+	mdata[LEGACY_LOOSE_KEY], mdata[LEGACY_LOADED_KEY] = nil, nil
+end
+local function inventory_event(kind, obj)
+	local id = object_id(obj)
+	if not id then return false end
+	if kind == "ruck" or kind == "slot" or kind == "belt" then
+		local data = data_for(id)
+		if kind == "slot" then adopt_slotted(id, data) end
+		if data and data.is_weapon and loadout_order(data) then
+			local slot = kind == "slot" and loaded_slot(id) or normalize_slot(data[SLOT_KEY]) or UNKNOWN_SLOT
+			if data[SLOT_KEY] ~= slot then data[SLOT_KEY] = slot commit(id, data) end
+			if type(slot) == "number" and kind == "slot" then dormant[id] = nil else dormant[id] = slot end
+			tracked[id] = true
+		end
+		layout_dirty, repack_requested = true, true
+		return true
+	end
+	if kind == "take" then
+		if target_sources[id] then return end
+		local data = data_for(id)
+		if not data then return end
+		if loadout_order(data) then tracked[id] = true
+		elseif embedded(data) then data[LOADOUT_KEY] = allocate_order(); commit(id, data); tracked[id] = true end
+		layout_dirty, repack_requested = true, true
+		return
+	end
+	local changed = forget(id, false)
+	local source_id = target_sources[id]
+	if source_id then transition(source_id) end
+	if kind == "unregister" and transitions[id] then transition(id) end
+	return changed
+end
+local function rebuild_actor_index()
+	local actor = db and db.actor
+	if not actor then return false end
+	local seen = {}
+	local function observe(obj, slotted)
+		local id = object_id(obj)
+		if not id then return end
+		local data = data_for(id)
+		if slotted then adopt_slotted(id, data) end
+		if seen[id] then return end
+		seen[id] = true
+		local order = loadout_order(data)
+		if not (order and actor_owned(id) ~= false) then return end
+		observe_order(order); tracked[id] = true
+		if data.is_weapon then note_dormant(id, data) end
+	end
+	pcall(function() actor:iterate_inventory(function(_, obj) observe(obj, false) end) end)
+	for slot = 1, 3 do pcall(function() observe(actor:item_in_slot(slot), true) end) end
+	return true
+end
+local function first_update()
+	equipment_ready, next_reconcile, layout_dirty, repack_requested = false, 0, true, false
+	rebuild_actor_index(); reconcile(false)
+	if RemoveTimeEvent then RemoveTimeEvent(EVENT_GROUP, READY_EVENT) end
+	if CreateTimeEvent then
+		CreateTimeEvent(EVENT_GROUP, READY_EVENT, 1, function()
+			equipment_ready = true rebuild_actor_index(); reconcile(false) return true
+		end)
+	else equipment_ready = true reconcile(false) end
+end
+-- Called first in the magazine frame so every later consumer in the same
+-- frame, the AML bridge's liveness probes among them, reads a packed layout.
+function on_frame_begin()
+	drain_repack()
+end
+function on_actor_update()
+	drain_repack()
+	local now = now_ms()
+	if now < next_reconcile then return end
+	next_reconcile = now + 1000
+	reconcile(false)
+end
+function on_game_load()
+	if RemoveTimeEvent then
+		RemoveTimeEvent(EVENT_GROUP, READY_EVENT)
+		for source_id in pairs(transitions) do RemoveTimeEvent(EVENT_GROUP, "transfer_" .. tostring(source_id)) end
+	end
+	tracked, dormant, transitions, target_sources, equipment_ready, next_reconcile = {}, {}, {}, {}, false, 0
+	-- load_state may run before or after this callback.  Never reset the saved
+	-- monotonic counter here; first_update also re-observes every actor record.
+	layout_dirty, layout_running, layout_signature, repack_requested = true, false, nil, false
+end
+local actor_bags = { actor_bag = true, actor_trade_bag = true }
+local reserve_color = nil
+local function reserve_highlight(cell)
+	local id = cell and cell.ID
+	local container = cell and cell.container and cell.container.ID
+	if not (id and actor_bags[container] and tracked[id] and
+		is_loose_loadout_mag(id) and not is_carried(id)) then return end
+	if reserve_color == nil and type(GetARGB) == "function" then reserve_color = GetARGB(85, 145, 145, 145) end
+	return reserve_color
+end
+local function register_highlight()
+	if hooks.highlight then return true end
+	if not (rax_persistent_highlight and type(rax_persistent_highlight.register) == "function") then return false end
+	local ok, err = pcall(rax_persistent_highlight.register, "mags_loadout_reserve", reserve_highlight)
+	if not ok then log_error("assignment: reserve highlight registration failed: %s", tostring(err)); return false end
+	hooks.highlight = true; return true
+end
+-- Only a loose loadout magazine is held in place: an inserted one shares its
+-- weapon's ID, and the weapon must still move to the ruck.
+local function guard_loose_move(flags, _, obj)
+	if flags and is_loose_loadout_mag(object_id(obj)) then flags.ret_value = false end
+end
+-- Install early: magazines.on_game_start later captures context-action aliases.
+install_binder_hooks()
+install_hook("description", ui_item, "ui_item", "item_description", wrapped_description)
+install_hook("disassembly", zzzz_arti_jamming_repairs, "zzzz_arti_jamming_repairs",
+	"custom_disassembly_weapon", wrapped_disassembly, true)
+function on_game_start()
+	install_binder_hooks()
+	install_hook("description", ui_item, "ui_item", "item_description", wrapped_description)
+	install_hook("retool", magazines, "magazines", "retool_mag_functor", wrapped_retool)
+	install_hook("disassembly", zzzz_arti_jamming_repairs, "zzzz_arti_jamming_repairs",
+		"custom_disassembly_weapon", wrapped_disassembly, true)
+	register_functors()
+	register_highlight()
+	if callbacks_registered then return end
+	callbacks_registered = true; RegisterScriptCallback("actor_on_first_update", first_update)
+	RegisterScriptCallback("actor_on_item_drop", function(first, second, _) return inventory_event("drop", second or first) end)
+	RegisterScriptCallback("actor_item_to_ruck", function(obj) return inventory_event("ruck", obj) end)
+	RegisterScriptCallback("actor_item_to_slot", function(obj) return inventory_event("slot", obj) end)
+	RegisterScriptCallback("actor_item_to_belt", function(obj) return inventory_event("belt", obj) end)
+	RegisterScriptCallback("actor_on_item_take", function(obj) inventory_event("take", obj) end)
+	RegisterScriptCallback("actor_on_item_put_in_box", function(_, obj) inventory_event("drop", obj) end)
+	RegisterScriptCallback("actor_on_item_take_from_box", function(_, obj) inventory_event("drop", obj) end)
+	RegisterScriptCallback("npc_on_item_take", function(_, obj) inventory_event("drop", obj) end)
+	RegisterScriptCallback("ActorMenu_on_item_after_move", function(_, obj, mode, bag_from)
+		if mode == "loot" and tonumber(bag_from) == 1 then inventory_event("drop", obj) end
+	end)
+	RegisterScriptCallback("ActorMenu_on_item_before_move", guard_loose_move)
+	RegisterScriptCallback("ActorMenu_on_trade_closed", function() reconcile(false) end)
+	RegisterScriptCallback("server_entity_on_unregister", function(obj) inventory_event("unregister", obj) end)
+end

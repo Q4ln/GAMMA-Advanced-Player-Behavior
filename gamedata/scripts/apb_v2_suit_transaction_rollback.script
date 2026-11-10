@@ -1,0 +1,310 @@
+-- Advanced Player Behavior v2: Suit Setups rollback partial.
+--
+-- install(Service, C) attaches the recovery half of the switch service to the
+-- Service class owned by apb_v2_suit_transaction: the guarded synchronous
+-- teardown restore and the queued rollback actions that put the previous suit,
+-- belt and helmet back.  Bodies are verbatim, so `self` is still the service;
+-- C carries the mode and timeout constants the transaction owns.
+
+function install(Service, C)
+	local ROLLBACK = C.ROLLBACK
+	local CHECKPOINT_TIMEOUT = C.CHECKPOINT_TIMEOUT
+	local BELT_MOVE_TIMEOUT = C.BELT_MOVE_TIMEOUT
+
+	function Service:restore_belt_safely(refs)
+		local actor = self:actor()
+		local outfit = actor and actor:item_in_slot(7) or nil
+		if not outfit then
+			return
+		end
+		for _, ref in ipairs(refs or {}) do
+			local item = self.equipment.resolve_belt_ref(ref, actor)
+			if item and not self:belt_contains(ref) and self:belt_admits(actor, outfit, ref) then
+				actor:move_to_belt(item)
+			end
+		end
+	end
+
+	function Service:restore_empty_slot(tx, actor, kind, slot, predicate)
+		local previous = tx.before[kind]
+		if actor:item_in_slot(slot) or not previous then
+			return
+		end
+		local item = self.equipment.resolve_ref(previous, predicate, actor)
+		local snapshot = tx.rollback_snapshot and tx.rollback_snapshot[kind] or nil
+		if not item and snapshot then
+			item = self.equipment.resolve_ref(snapshot, predicate, actor)
+		end
+		if item then
+			actor:move_to_slot(item, slot)
+		end
+	end
+
+	-- Teardown/watchdog fallback: fill only empty equipment slots and absent belt
+	-- pieces.  It never removes a currently valid item without a queue checkpoint.
+	function Service:restore_previous_immediate(tx)
+		local actor = self:actor()
+		if not (tx and tx.before and actor) then
+			return false
+		end
+
+		self:restore_empty_slot(tx, actor, "suit", 7, IsOutfit)
+		self:restore_empty_slot(tx, actor, "helmet", 12, IsHeadgear)
+
+		if tx.before.suit and self:slot_matches(7, tx.before.suit) then
+			self:restore_belt_safely(tx.before.belt)
+		elseif tx.rollback_snapshot and tx.rollback_snapshot.suit
+			and self:slot_matches(7, tx.rollback_snapshot.suit)
+		then
+			self:restore_belt_safely(tx.rollback_snapshot.belt)
+		end
+
+		local complete = self:equipment_state_matches(actor, tx.before)
+		self:trace("slot %d immediate teardown restore %s", tx.index, complete and "complete" or "guarded")
+		return complete
+	end
+
+	function Service:enqueue_rollback_belt_transfer(tx, ref, source)
+		local name = "gss_rollback_belt_" .. source .. "_" .. tostring(ref.object_id)
+		local state = {wait_for_settle = false, sound_played = false}
+		local function source_suit_matches()
+			local expected = source == "previous" and tx.before.suit or tx.rollback_snapshot.suit
+			return expected and self:slot_matches(7, expected)
+		end
+
+		self:enqueue_direct(tx, name, function()
+			if tx.rollback_belt_source ~= source then
+				return
+			end
+			if not source_suit_matches() then
+				self:mark_rollback_issue(tx, "verified rollback suit changed before " .. ref.section)
+				return
+			end
+			if self:belt_contains(ref) then
+				return
+			end
+			local actor = self:actor()
+			local item = self.equipment.resolve_belt_ref(ref, actor)
+			local outfit = actor:item_in_slot(7)
+			if not item then
+				self:mark_rollback_issue(tx, ref.section .. " is no longer carried")
+				return
+			end
+			if not outfit or not self:belt_admits(actor, outfit, ref) then
+				self:mark_rollback_issue(tx, ref.section .. " does not fit the rollback belt")
+				return
+			end
+			actor:move_to_belt(item)
+			state.wait_for_settle = true
+		end, ROLLBACK)
+
+		self:enqueue_checkpoint(tx, name .. "_checkpoint", function()
+			if tx.rollback_belt_source ~= source or not state.wait_for_settle then
+				return true
+			end
+			if not source_suit_matches() then
+				local item = self.equipment.resolve_belt_ref(ref, self:actor())
+				if item and self:belt_contains(ref) then
+					self:actor():move_to_ruck(item)
+				end
+				self:mark_rollback_issue(tx, "verified rollback suit changed while equipping " .. ref.section)
+				return true
+			end
+			if self:belt_contains(ref) then
+				self:play_settled_belt_sound(tx, state, ref, false)
+				return true
+			end
+			return false
+		end, BELT_MOVE_TIMEOUT, function()
+			self:mark_rollback_issue(tx, ref.section .. " did not settle during rollback")
+		end, ROLLBACK)
+	end
+
+	-- Suit and helmet rollback use the same guarded slot transaction.  Keeping
+	-- the field, slot, and type policy as parameters preserves the exact action
+	-- order while preventing the two safety paths from drifting apart.
+	-- `allowed[kind]` is the rollback queue's per-kind permission, set by its
+	-- preflight and withdrawn by any action that must preserve the slot.
+	function Service:enqueue_rollback_slot(tx, kind, slot, predicate, allowed)
+		local state = {restored = false, fallback_attempted = false}
+		local action_prefix = "gss_rollback_" .. kind
+		local previous = tx.before[kind]
+		local snapshot = tx.rollback_snapshot[kind]
+
+		self:enqueue_direct(tx, action_prefix .. "_unequip", function()
+			if not allowed[kind] then
+				return
+			end
+			local actor = self:actor()
+			if previous and not self.equipment.resolve_ref(previous, predicate, actor) then
+				allowed[kind] = false
+				self:mark_rollback_issue(tx, "previous " .. kind .. " vanished before current " .. kind .. " removal")
+				return
+			end
+			local current = actor:item_in_slot(slot)
+			if current and not self.equipment.object_matches_ref(current, previous) then
+				if self.equipment.object_matches_ref(current, snapshot) then
+					actor:move_to_ruck(current)
+				else
+					allowed[kind] = false
+					self:mark_rollback_issue(tx, "unexpected " .. kind .. " appeared during rollback; it was preserved")
+				end
+			end
+		end, ROLLBACK)
+
+		self:enqueue_checkpoint(tx, action_prefix .. "_empty", function()
+			if not allowed[kind] then
+				return true
+			end
+			if previous and self:slot_matches(slot, previous) then
+				return true
+			end
+			return not self:actor():item_in_slot(slot)
+		end, CHECKPOINT_TIMEOUT, function()
+			allowed[kind] = false
+			self:mark_rollback_issue(tx, "current " .. kind .. " did not leave its slot during rollback")
+		end, ROLLBACK)
+
+		self:enqueue_direct(tx, action_prefix .. "_equip", function()
+			if not allowed[kind] or not previous or self:slot_matches(slot, previous) then
+				return
+			end
+			local actor = self:actor()
+			local item = self.equipment.resolve_ref(previous, predicate, actor)
+			if not item then
+				allowed[kind] = false
+				self:mark_rollback_issue(tx, "previous " .. kind .. " vanished before rollback equip")
+				return
+			end
+			if actor:item_in_slot(slot) then
+				allowed[kind] = false
+				self:mark_rollback_issue(tx, kind .. " slot remained occupied during rollback")
+				return
+			end
+			actor:move_to_slot(item, slot)
+		end, ROLLBACK)
+
+		self:enqueue_checkpoint(tx, action_prefix .. "_checkpoint", function()
+			if not allowed[kind] then
+				return true
+			end
+			return self:slot_state_matches(self:actor(), slot, previous)
+		end, CHECKPOINT_TIMEOUT, function()
+			allowed[kind] = false
+			self:mark_rollback_issue(tx, "previous " .. kind .. " did not settle")
+		end, ROLLBACK)
+
+		self:enqueue_direct(tx, action_prefix .. "_fallback", function()
+			state.restored = self:slot_state_matches(self:actor(), slot, previous)
+			if state.restored or self:actor():item_in_slot(slot) or not snapshot then
+				return
+			end
+			local fallback = self.equipment.resolve_ref(snapshot, predicate, self:actor())
+			if fallback then
+				state.fallback_attempted = true
+				self:actor():move_to_slot(fallback, slot)
+			else
+				self:mark_rollback_issue(tx, "both previous and fallback " .. kind .. "s are unavailable")
+			end
+		end, ROLLBACK)
+
+		self:enqueue_checkpoint(tx, action_prefix .. "_fallback_checkpoint", function()
+			if state.restored or not state.fallback_attempted then
+				return true
+			end
+			return self:slot_matches(slot, snapshot)
+		end, CHECKPOINT_TIMEOUT, function()
+			self:mark_rollback_issue(tx, "fallback " .. kind .. " did not settle")
+		end, ROLLBACK)
+	end
+
+	function Service:enqueue_rollback(tx)
+		local allowed = {}
+		self:enqueue_direct(tx, "gss_rollback_preflight", function()
+			allowed.suit = not tx.before.suit
+				or self.equipment.resolve_ref(tx.before.suit, IsOutfit, self:actor()) ~= nil
+			allowed.helmet = not tx.before.helmet
+				or self.equipment.resolve_ref(tx.before.helmet, IsHeadgear, self:actor()) ~= nil
+			if not allowed.suit then
+				self:mark_rollback_issue(tx, "previous exact suit is missing; current suit and belt will be preserved")
+			end
+			if not allowed.helmet then
+				self:mark_rollback_issue(tx, "previous exact helmet is missing; current helmet will be preserved")
+			end
+		end, ROLLBACK)
+
+		self:enqueue_direct(tx, "gss_rollback_belt_clear_validate", function()
+			if not allowed.suit then
+				return
+			end
+			local actor = self:actor()
+			local snapshot_suit_ok = self:slot_state_matches(actor, 7, tx.rollback_snapshot.suit)
+			if not snapshot_suit_ok or not self.equipment.belt_matches(tx.rollback_snapshot.belt) then
+				allowed.suit = false
+				self:mark_rollback_issue(tx, "suit or belt changed after rollback snapshot; current equipment will be preserved")
+				return
+			end
+			if tx.before.suit and not self.equipment.resolve_ref(tx.before.suit, IsOutfit, actor) then
+				allowed.suit = false
+				self:mark_rollback_issue(tx, "previous suit vanished before rollback belt clear")
+				return
+			end
+		end, ROLLBACK)
+
+		for _, ref in ipairs(tx.rollback_snapshot.belt or {}) do
+			self:enqueue_belt_move_out(tx, ref, "gss_rollback_belt_clear_" .. tostring(ref.object_id), ROLLBACK, function()
+				return allowed.suit
+			end, false, function()
+				allowed.suit = false
+				self:mark_rollback_issue(tx, ref.section .. " did not leave the belt during rollback")
+			end)
+		end
+
+		self:enqueue_checkpoint(tx, "gss_rollback_belt_empty", function()
+			return not allowed.suit or self:actor():belt_count() == 0
+		end, CHECKPOINT_TIMEOUT, function()
+			allowed.suit = false
+			self:mark_rollback_issue(tx, "belt could not be cleared; current suit will be preserved")
+		end, ROLLBACK)
+
+		self:enqueue_rollback_slot(tx, "suit", 7, IsOutfit, allowed)
+
+		self:enqueue_direct(tx, "gss_rollback_choose_belt", function()
+			local previous_suit_ok = self:slot_state_matches(self:actor(), 7, tx.before.suit)
+			if previous_suit_ok then
+				tx.rollback_belt_source = "previous"
+			elseif tx.rollback_snapshot.suit and self:slot_matches(7, tx.rollback_snapshot.suit) then
+				tx.rollback_belt_source = "snapshot"
+			else
+				tx.rollback_belt_source = "none"
+				self:mark_rollback_issue(tx, "no verified suit is available for belt restoration")
+			end
+		end, ROLLBACK)
+
+		for _, ref in ipairs(tx.before.belt or {}) do
+			self:enqueue_rollback_belt_transfer(tx, ref, "previous")
+		end
+		for _, ref in ipairs(tx.rollback_snapshot.belt or {}) do
+			self:enqueue_rollback_belt_transfer(tx, ref, "snapshot")
+		end
+
+		self:enqueue_checkpoint(tx, "gss_rollback_belt_checkpoint", function()
+			local state = tx.rollback_belt_source == "previous" and tx.before
+				or tx.rollback_belt_source == "snapshot" and tx.rollback_snapshot
+			if state then
+				return self:slot_state_matches(self:actor(), 7, state.suit)
+					and self.equipment.belt_matches(state.belt)
+			end
+			return true
+		end, CHECKPOINT_TIMEOUT, function()
+			self:mark_rollback_issue(tx, "rollback belt layout did not settle exactly")
+		end, ROLLBACK)
+
+		self:enqueue_rollback_slot(tx, "helmet", 12, IsHeadgear, allowed)
+
+		self:enqueue_direct(tx, "gss_rollback_complete", function()
+			tx.rollback_queue_complete = true
+			self:trace("slot %d reached rollback sentinel", tx.index)
+		end, ROLLBACK)
+	end
+end

@@ -1,0 +1,475 @@
+-- Shared runtime and early WPO hook of Advanced Player Behavior's magazine
+-- subsystem, loaded before the subsystem registers any callback.  The five
+-- magazine filenames are fixed: their z-prefix count orders the load (this
+-- core, the assignment service, the AML bridge, then the Reload controller
+-- last so it wraps level_input and the Mags/WPO/AML/DRS surfaces).  The exact
+-- names are also what wins the file conflict against the superseded
+-- standalone package, so renaming one would let a still-installed standalone
+-- copy load beside APB's and wrap level_input twice.
+local api = apb_v2_core
+local LOG_SCOPE, EVENT_GROUP = "MAGS-COMPAT", "mags_compat_core"
+local GUARD_TIMEOUT = 15
+local unpack = unpack
+local guards, guard_serial = {}, 0
+local clone_sync_ids = {}
+-- Bind stable dependency entry points once.  The reload-speed clearer is the
+-- sole exception: DRS companion scripts may wrap it during on_game_start.
+local host = {
+	mags_action = magazines and magazines.action_in_progress,
+	mags_jammed = magazines and magazines.is_jammed_weapon,
+	mags_supports = magazines and magazines.is_supported_weapon,
+	prep_weapon = magazines and magazines.prep_weapon,
+	binder_get = magazine_binder and magazine_binder.get_data,
+	binder_set = magazine_binder and magazine_binder.set_data,
+	wpo_get = arti_jamming and arti_jamming.get_jammed,
+	wpo_unjam = arti_jamming and arti_jamming.unjam,
+}
+local HAS_WPO = type(host.wpo_get) == "function" and type(host.wpo_unjam) == "function"
+local function cancel_event(action) RemoveTimeEvent(EVENT_GROUP, action) end
+-- One build identity for the whole package; the subsystem reads it from here.
+BUILD = api.BUILD
+-- Explicit service registry.  A script reaches one that loads after it only
+-- through here, at call time: this core -> the assignment service and the AML
+-- bridge, the assignment service -> the AML bridge, and the AML bridge -> the
+-- Reload controller.  A missing service is simply absent.
+-- Each script registers with `this`, the namespace table the engine binds
+-- before running it; refuse anything else loudly rather than losing the link.
+local services = {}
+function register_service(name, namespace)
+	if type(namespace) ~= "table" then
+		log_error("service %s was registered without a namespace table", tostring(name))
+		return false
+	end
+	services[name] = namespace
+	return true
+end
+function service(name) return services[name] end
+-- Hooks on GAMMA Mags and its companions that could not be installed.  Every
+-- install site reports each hook it owns through record_seam(hook, missing):
+-- missing is nil once the hook is in place, otherwise the host member (or the
+-- host) that was absent.  A later successful install clears the entry.  The
+-- Reload controller installs last and reports whatever is left as one
+-- "Mags API mismatch" line, so a Mags update that renames or drops an entry
+-- point is named in the log instead of failing silently.
+local seam_missing, seam_order = {}, {}
+local seam_mismatch_reported = false
+function record_seam(hook, missing)
+	if not missing then
+		if seam_missing[hook] then seam_missing[hook] = false end
+		return
+	end
+	if seam_missing[hook] == nil then seam_order[#seam_order + 1] = hook end
+	seam_missing[hook] = tostring(missing)
+end
+-- The hooks still missing, in the order they were first reported, and the
+-- distinct absent members behind them.
+local function failed_seams()
+	local hooks, missing, seen = {}, {}, {}
+	for i = 1, #seam_order do
+		local member = seam_missing[seam_order[i]]
+		if member then
+			hooks[#hooks + 1] = seam_order[i]
+			if not seen[member] then seen[member] = true; missing[#missing + 1] = member end
+		end
+	end
+	return hooks, missing
+end
+function report_seam_mismatch()
+	if seam_mismatch_reported then return false end
+	local hooks, missing = failed_seams()
+	if #hooks == 0 then return false end
+	seam_mismatch_reported = true
+	log_error("Mags API mismatch | build=%s | hooks not installed: %s | missing: %s",
+		tostring(BUILD), table.concat(hooks, ", "), table.concat(missing, ", "))
+	return true
+end
+-- The first "<host_name>.<member>" that host does not provide as a function,
+-- host_name itself when host is absent, or nil when every member is there.
+function missing_member(host, host_name, members)
+	if host == nil then return host_name end
+	for i = 1, #members do
+		if type(host[members[i]]) ~= "function" then return host_name .. "." .. members[i] end
+	end
+	return nil
+end
+-- The core logger already takes a scope, so these stay one line each and every
+-- subsystem line reads "[ADVANCED-PLAYER-BEHAVIOR:MAGS-COMPAT] ...".
+function log_info(fmt, ...) api.log_info(LOG_SCOPE, fmt, ...) end
+function log_error(fmt, ...) api.log_error(LOG_SCOPE, fmt, ...) end
+function pack_results(...) return { n = select("#", ...), ... } end
+function deep_copy(value, seen)
+	if type(value) ~= "table" then return value end
+	seen = seen or {}
+	if seen[value] then return seen[value] end
+	local result = {}
+	seen[value] = result
+	for key, child in pairs(value) do
+		result[deep_copy(key, seen)] = deep_copy(child, seen)
+	end
+	return result
+end
+function deep_equal(left, right, seen)
+	if left == right then return true end
+	if type(left) ~= "table" or type(right) ~= "table" then return false end
+	seen = seen or {}
+	if seen[left] then return seen[left] == right end
+	seen[left] = right
+	for key, value in pairs(left) do if not deep_equal(value, right[key], seen) then return false end end
+	for key in pairs(right) do if left[key] == nil then return false end end
+	return true
+end
+-- The protected reads below are file-level functions: a per-call closure would
+-- allocate on every lookup, and inventory sweeps make many.
+local function own_id(obj)
+	if type(obj.id) == "number" then return obj.id end
+	return obj:id()
+end
+local function own_section(obj)
+	if type(obj.section) == "function" then return obj:section() end
+	if type(obj.section_name) == "function" then return obj:section_name() end
+end
+local function active_item_of(actor) return actor:active_item() end
+local function slotted_item_of(actor)
+	local slot = actor:active_slot()
+	if slot ~= nil then return actor:item_in_slot(slot) end
+end
+local function ammo_match(item, section, excluded_id)
+	return IsAmmo(item) and item:id() ~= excluded_id and item:section() == section and item:ammo_get_count() > 0
+end
+-- Not api.actor_id: that only calls obj:id(), while this also accepts a plain
+-- number and a table carrying a numeric .id field.
+function object_id(obj)
+	if not obj then return nil end
+	if type(obj) == "number" then return obj end
+	local ok, id = pcall(own_id, obj)
+	return ok and id or nil
+end
+function section_of(obj)
+	if not obj then return nil end
+	if type(obj) == "string" then return obj end
+	local ok, section = pcall(own_section, obj)
+	return ok and section or nil
+end
+function is_weapon(obj) return obj and IsWeapon(obj) or false end
+-- Not the player adapter's active_weapon(): that resolves a per-epoch snapshot
+-- table; this returns the item itself, with an active-slot fallback.
+function active_weapon()
+	local actor = db and db.actor
+	if not actor then return nil end
+	local ok, item = pcall(active_item_of, actor)
+	if not (ok and item) then ok, item = pcall(slotted_item_of, actor) end
+	return ok and is_weapon(item) and item or nil
+end
+-- One clock for the package: the core samples time_continual once per frame
+-- inside its update and takes a fresh read outside it.
+function now_ms() return api.now_ms() end
+-- Not api.get_setting: that reads APB's own settings table, this reads the AML
+-- field-load MCM with a caller-supplied fallback.  Same name, different job.
+function get_setting(key, fallback)
+	local ok, value = pcall(mags_aml_field_load_mcm.get_config, key)
+	if ok and value ~= nil then return value end
+	return fallback
+end
+function inventory_refresh(mode) if magazines then pcall(magazines.inventory_refresh, mode or 2) end end
+function find_ammo(priority, exhausted, excluded_id)
+	exhausted = exhausted or {}
+	local actor = db and db.actor
+	if not actor then return nil, nil end
+	for i = 1, #(priority or {}) do
+		local section = priority[i]
+		if section and not exhausted[section] then
+			local ammo = nil
+			pcall(function()
+				actor:iterate_inventory(function(_, item)
+					if ammo or not item then return end
+					local ok, match = pcall(ammo_match, item, section, excluded_id)
+					if ok and match then ammo = item end
+				end)
+			end)
+			if ammo then return ammo, section end
+			exhausted[section] = true
+		end
+	end
+	return nil, nil
+end
+-- Restore the host entry even when fn raises, and retain nil/multiple returns.
+function scoped_override(owner, key, replacement, fn, ...)
+	if type(owner) ~= "table" or type(fn) ~= "function" then error("invalid scoped_override contract", 2) end
+	local previous = owner[key]
+	owner[key] = replacement
+	local results = pack_results(pcall(fn, ...))
+	owner[key] = previous
+	if not results[1] then error(results[2], 0) end
+	return unpack(results, 2, results.n)
+end
+function data_for(id)
+	if id == nil or type(host.binder_get) ~= "function" then return nil end
+	local ok, data = pcall(host.binder_get, id)
+	if not ok then return nil, data end
+	return type(data) == "table" and data or nil
+end
+function equipped_slot(id)
+	local actor = db and db.actor
+	if not actor or id == nil then return nil end
+	for slot = 1, 3 do if object_id(actor:item_in_slot(slot)) == id then return slot end end
+end
+local function mags_supports_weapon(weapon)
+	if type(host.mags_supports) ~= "function" then return false end
+	local ok, result = pcall(host.mags_supports, weapon)
+	if not ok then
+		log_error("Mags support query failed | section=%s | %s",
+			section_of(weapon) or "unknown", tostring(result))
+		return nil
+	end
+	return result and true or false
+end
+local function wpo_status(id, quiet)
+	if type(host.wpo_get) ~= "function" then return nil, nil end
+	local ok, status = pcall(host.wpo_get, id)
+	if not ok then
+		if not quiet then
+			log_error("WPO get_jammed failed | weapon_id=%s | %s", tostring(id), tostring(status))
+		end
+		return nil, false, status
+	end
+	return status, true
+end
+-- Shared readiness result.  Jam states outrank ordinary busy states so the
+-- controller always replays canonical Reload into the fail-closed WPO route.
+function readiness(weapon, expected_id)
+	local id = object_id(weapon)
+	if not is_weapon(weapon) or id == nil or expected_id ~= nil and id ~= expected_id then return "invalid" end
+	local status, query_ok = wpo_status(id, true)
+	if query_ok == false then return "wpo_query_failed" end
+	if query_ok and status then return "wpo_jam" end
+	if guards[id] then return "unjam_guard" end
+	if type(host.mags_jammed) == "function" then
+		local ok, jammed = pcall(host.mags_jammed, weapon)
+		if not ok then return "query_failed" end
+		if jammed then return "engine_misfire" end
+	end
+	local misfire_ok, misfire = pcall(function()
+		local casted = weapon:cast_Weapon()
+		return casted and casted:IsMisfire()
+	end)
+	if not misfire_ok then return "query_failed" end
+	if misfire then return "engine_misfire" end
+	local grenade_ok, grenade = pcall(function() return weapon:weapon_in_grenade_mode() end)
+	if not grenade_ok then return "query_failed" end
+	if grenade then return "grenade" end
+	if type(host.mags_action) == "function" then
+		local ok, busy = pcall(host.mags_action)
+		if not ok then return "query_failed" end
+		if busy then return "mags_busy" end
+	end
+	if arti_jamming and arti_jamming.anim_playing then return "weapon_busy" end
+	local state_ok, state = pcall(function() return weapon:get_state() end)
+	if not state_ok then return "query_failed" end
+	if state ~= 0 then return "weapon_busy" end
+	return "healthy"
+end
+local function clear_pending_speed()
+	local clear = mag_reload_speed and mag_reload_speed.clear_pending_mag
+	if type(clear) ~= "function" then return end
+	local ok, err = pcall(clear)
+	if not ok then log_error("failed to clear pending reload-speed state: %s", tostring(err)) end
+end
+local function schedule_speed_clear(id)
+	clear_pending_speed()
+	local action = "clear_speed_" .. tostring(id or 0)
+	cancel_event(action)
+	CreateTimeEvent(EVENT_GROUP, action, 0, function()
+		clear_pending_speed()
+		return true
+	end)
+end
+local function clear_guard(id)
+	if id == nil then return end
+	guards[id] = nil
+	cancel_event("unjam_guard_" .. tostring(id))
+end
+local function arm_guard(id)
+	guard_serial = guard_serial + 1
+	local record = { serial = guard_serial, animation_started = false }
+	guards[id] = record
+	local action = "unjam_guard_" .. tostring(id)
+	cancel_event(action)
+	CreateTimeEvent(EVENT_GROUP, action, GUARD_TIMEOUT, function(guarded_id, serial)
+		local current = guards[guarded_id]
+		if current and current.serial == serial then
+			guards[guarded_id] = nil
+			clear_pending_speed()
+			log_info("released expired unjam guard | weapon_id=%s", tostring(guarded_id))
+		end
+		return true
+	end, id, record.serial)
+end
+local function route_reload_to_wpo(weapon, id, status)
+	local supported = mags_supports_weapon(weapon)
+	if supported ~= false then arm_guard(id) else clear_guard(id) end
+	-- AML installs its interrupt wrapper later, so resolve the current host here.
+	local interrupt = magazines and magazines.do_interrupt
+	if type(interrupt) == "function" then
+		local interrupt_ok, interrupt_err = pcall(interrupt)
+		if not interrupt_ok then log_error("Mags reload interrupt failed: %s", tostring(interrupt_err)) end
+	end
+	clear_pending_speed()
+	log_info("Reload -> WPO unjam | section=%s | weapon_id=%s | status=%s | mags_supported=%s",
+		section_of(weapon) or "unknown", tostring(id), tostring(status), tostring(supported))
+	local ok, err = pcall(host.wpo_unjam, weapon)
+	schedule_speed_clear(id)
+	if not ok then
+		log_error("WPO unjam failed | weapon_id=%s | %s", tostring(id), tostring(err))
+		if supported == false then clear_guard(id) end
+		return
+	end
+	if supported == false then clear_guard(id) end
+	local remaining, query_ok = wpo_status(id, true)
+	if query_ok and remaining then
+		clear_guard(id)
+		local rounds = nil
+		pcall(function() rounds = weapon:get_ammo_in_magazine() end)
+		log_info("WPO retained jam | section=%s | weapon_id=%s | status=%s | rounds=%s",
+			section_of(weapon) or "unknown", tostring(id), tostring(remaining), tostring(rounds))
+	end
+end
+local function install_input_hook()
+	if not magazines or type(magazines.on_key_press) ~= "function" then return false end
+	if magazines.__mags_compat_core_reload_hook then return true end
+	local original = magazines.on_key_press
+	magazines.on_key_press = function(key, bind, dis, flags, ...)
+		if key_bindings and bind == key_bindings.kINVENTORY then
+			local aml = service("aml")
+			if aml and type(aml.active) == "function" then
+				local ok, running = pcall(aml.active)
+				if ok and running then return end
+			end
+		end
+		if HAS_WPO and key_bindings and bind == key_bindings.kWPN_RELOAD then
+			local weapon = active_weapon()
+			local id = object_id(weapon)
+			if weapon and id ~= nil then
+				local status, query_ok = wpo_status(id, false)
+				if query_ok and status then
+					if flags then flags.ret_value = false end
+					route_reload_to_wpo(weapon, id, status)
+					return
+				end
+				if query_ok == false then
+					if flags then flags.ret_value = false end
+					return
+				end
+				if guards[id] then
+					if mags_supports_weapon(weapon) ~= false then
+						if flags then flags.ret_value = false end
+						return
+					end
+					clear_guard(id)
+				end
+			end
+		end
+		return original(key, bind, dis, flags, ...)
+	end
+	magazines.__mags_compat_core_reload_hook = true
+	return true
+end
+local function schedule_clone_sync(new_id, old_id)
+	if type(host.prep_weapon) ~= "function" or not (level and type(level.object_by_id) == "function") then return end
+	local action = "sync_clone_" .. tostring(new_id)
+	local deadline, attempts = now_ms() + 5000, 0
+	cancel_event(action)
+	clone_sync_ids[new_id] = true
+	CreateTimeEvent(EVENT_GROUP, action, 0, function(id, source_id, stop_time)
+		attempts = attempts + 1
+		local weapon = level.object_by_id(id)
+		local prep_error = nil
+		if weapon then
+			local ok, err = pcall(host.prep_weapon, weapon, false)
+			if ok then clone_sync_ids[id] = nil; return true end
+			prep_error = err
+		end
+		if now_ms() >= stop_time or attempts >= 300 then
+			clone_sync_ids[id] = nil
+			if prep_error then
+				log_error("failed to synchronize cloned weapon | old_id=%s | new_id=%s | %s",
+					tostring(source_id), tostring(id), tostring(prep_error))
+			else log_error("cloned weapon did not become online | old_id=%s | new_id=%s",
+					tostring(source_id), tostring(id)) end
+			return true
+		end
+		return false
+	end, new_id, old_id, deadline)
+end
+local function install_clone_hook()
+	if type(_G.alife_clone_weapon) ~= "function" or type(host.binder_get) ~= "function" or
+		type(host.binder_set) ~= "function" or type(host.prep_weapon) ~= "function" or
+		not (level and type(level.object_by_id) == "function") then return false end
+	if _G.__mags_compat_core_clone_hook then return true end
+	local original = _G.alife_clone_weapon
+	-- mags_patches' own clone wrapper already moves the magazine record to the
+	-- new id; this layer only notifies the assignment service and resyncs.
+	_G.alife_clone_weapon = function(se_obj, ...)
+		local old_id = object_id(se_obj)
+		local snapshot = old_id and data_for(old_id) or nil
+		if snapshot then snapshot = deep_copy(snapshot) end
+		local slot = equipped_slot(old_id)
+		local results = pack_results(original(se_obj, ...))
+		local new_id = object_id(results[1])
+		if new_id and new_id ~= old_id and snapshot then
+			local target = data_for(new_id)
+			if type(target) == "table" and snapshot.is_weapon == target.is_weapon and
+				snapshot.section == target.section then
+				local assignment = service("assignment")
+				local callback = assignment and assignment.on_record_transfer
+				if type(callback) == "function" then
+					local notify_ok, notify_err = pcall(callback, "clone", old_id, new_id,
+						deep_copy(target), { slot = slot })
+					if not notify_ok then
+						log_error("assignment clone notification failed | old_id=%s | new_id=%s | %s",
+							tostring(old_id), tostring(new_id), tostring(notify_err))
+					end
+				end
+				schedule_clone_sync(new_id, old_id)
+			end
+		end
+		return unpack(results, 1, results.n)
+	end
+	_G.__mags_compat_core_clone_hook = true
+	return true
+end
+-- The final Reload controller calls these through its single dispatcher.
+function on_weapon_reload(weapon)
+	local id = object_id(weapon); if id ~= nil and guards[id] then schedule_speed_clear(id) end end
+function on_hud_animation_play(anim_table, obj)
+	local name = anim_table and anim_table.anm_name or nil
+	if type(name) ~= "string" or not string.find(string.lower(name), "misfire", 1, true) then return end
+	local id = object_id(obj)
+	if id ~= nil and guards[id] then guards[id].animation_started = true end
+	schedule_speed_clear(0)
+end
+function on_hud_animation_end(item, section, motion, state, slot)
+	local id = object_id(item)
+	if id ~= nil and guards[id] and guards[id].animation_started then
+		clear_pending_speed()
+		clear_guard(id)
+	end
+end
+function on_game_load()
+	for id in pairs(clone_sync_ids) do cancel_event("sync_clone_" .. tostring(id)) end
+	clone_sync_ids = {}
+	for id in pairs(guards) do clear_guard(id) end
+	clear_pending_speed()
+end
+local clone_hook_installed = install_clone_hook()
+local input_hook_installed = install_input_hook()
+record_seam("magazines.on_key_press",
+	not input_hook_installed and missing_member(magazines, "magazines", { "on_key_press" }) or nil)
+record_seam("_G.alife_clone_weapon", not clone_hook_installed and (
+	missing_member(_G, "_G", { "alife_clone_weapon" }) or
+	missing_member(magazine_binder, "magazine_binder", { "get_data", "set_data" }) or
+	missing_member(magazines, "magazines", { "prep_weapon" }) or
+	missing_member(level, "level", { "object_by_id" })) or nil)
+function capabilities()
+	return { wpo = HAS_WPO and (input_hook_installed and "present" or "incomplete") or "absent", clone = clone_hook_installed,
+		drs = ver_dynamic_reload_speeds and "present" or "absent" }
+end

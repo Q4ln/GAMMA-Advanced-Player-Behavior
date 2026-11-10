@@ -1,0 +1,69 @@
+-- MCM page of Advanced Player Behavior's magazine subsystem, covering the AML
+-- field-loading bridge.  It keeps its own root so GAMMA.Mags.Reloaded's MCM is
+-- never replaced and the player's saved settings survive; that root id is a
+-- live persistence key.  Fixed filename: it wins the file conflict with the
+-- standalone package; see zzz_mags_compat_core.
+local api = apb_v2_core
+local ROOT = "mags_aml_field_load"
+local defaults = {
+	enabled = true,
+	hold_time = 0.45,
+	load_speed = 1.0,
+	unload_speed = 1.0,
+	chamber_animation = true,
+}
+function get_config(key)
+	local fallback = defaults[key]
+	if ui_mcm then
+		local value = ui_mcm.get(ROOT .. "/" .. tostring(key))
+		if value ~= nil then
+			return value
+		end
+	end
+	return fallback
+end
+function on_mcm_load()
+	return {
+		id = ROOT,
+		sh = true,
+		gr = {
+			{
+				id = "title",
+				type = "slide",
+				link = "ui_options_slider_player",
+				text = "ui_mcm_menu_mags_aml_field_load",
+				size = { 512, 50 },
+				spacing = 20,
+			},
+			{ id = "enabled", type = "check", val = 1, def = defaults.enabled },
+			{ id = "chamber_animation", type = "check", val = 1, def = defaults.chamber_animation },
+			{
+				id = "hold_time",
+				type = "track",
+				val = 2,
+				min = 0.2,
+				max = 1.5,
+				step = 0.05,
+				def = defaults.hold_time,
+			},
+			{ id = "line_speed", type = "line" },
+			{ id = "load_speed", type = "track", val = 2, min = 0.5, max = 2.0, step = 0.1, def = defaults.load_speed },
+			{ id = "unload_speed", type = "track", val = 2, min = 0.5, max = 2.0, step = 0.1, def = defaults.unload_speed },
+			{ id = "line_desc", type = "line" },
+			{ id = "description", type = "desc", text = "ui_mcm_mags_aml_field_load_description", clr = { 255, 180, 180, 180 } },
+		},
+	}
+end
+-- No lifecycle of its own: the composition root applies this after
+-- core.start() and after every option change.
+function apply_speed()
+	if not (magazines_aml and type(magazines_aml.set_speed) == "function") then
+		return
+	end
+	local load_speed = tonumber(get_config("load_speed")) or defaults.load_speed
+	local unload_speed = tonumber(get_config("unload_speed")) or defaults.unload_speed
+	local ok, err = pcall(magazines_aml.set_speed, load_speed, unload_speed)
+	if not ok then
+		api.log_error("MAGS-COMPAT", "AML speed settings failed: %s", tostring(err))
+	end
+end

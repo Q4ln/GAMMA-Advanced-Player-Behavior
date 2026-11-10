@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<string_table>
+	<string id="ui_apb_v2_suit_menu"><text>Suit Setups...</text></string>
+	<string id="ui_apb_v2_suit_title"><text>Suit Setups</text></string>
+	<string id="ui_apb_v2_suit_wheel_title"><text>Suit Setups</text></string>
+	<string id="ui_apb_v2_suit_save"><text>Save</text></string>
+	<string id="ui_apb_v2_suit_apply"><text>Apply</text></string>
+	<string id="ui_apb_v2_suit_delete"><text>Delete</text></string>
+	<string id="ui_apb_v2_suit_close"><text>Close</text></string>
+	<string id="ui_apb_v2_suit_name"><text>Name (10 characters maximum)</text></string>
+	<string id="ui_apb_v2_suit_accept"><text>OK</text></string>
+	<string id="ui_apb_v2_suit_cancel"><text>Cancel</text></string>
+	<string id="ui_apb_v2_suit_confirm_overwrite"><text>Overwrite setup "%s"?</text></string>
+	<string id="ui_apb_v2_suit_confirm_delete"><text>Delete setup "%s"?</text></string>
+	<string id="ui_apb_v2_suit_operation_failed"><text>The setup could not be changed.</text></string>
+
+	<string id="ui_apb_v2_suit_status_empty"><text>Empty</text></string>
+	<string id="ui_apb_v2_suit_status_equipped"><text>Equipped</text></string>
+	<string id="ui_apb_v2_suit_status_unavailable"><text>Unavailable</text></string>
+	<string id="ui_apb_v2_suit_status_partial"><text>Partial</text></string>
+	<string id="ui_apb_v2_suit_status_ready"><text>Ready</text></string>
+
+	<string id="ui_apb_v2_suit_timer_foreign"><text>Suit setup failed because its scheduler stopped; another animation prevented safe restoration.</text></string>
+	<string id="ui_apb_v2_suit_timer_restored"><text>Suit setup failed because its scheduler stopped; previous equipment was restored.</text></string>
+	<string id="ui_apb_v2_suit_timer_incomplete"><text>Suit setup failed because its scheduler stopped; guarded restoration was incomplete.</text></string>
+	<string id="ui_apb_v2_suit_timer_stopped"><text>Suit setup could not continue because its scheduler stopped.</text></string>
+	<string id="ui_apb_v2_suit_timer_start_failed"><text>Suit setup could not start because its scheduler failed.</text></string>
+	<string id="ui_apb_v2_suit_rollback_blocked"><text>Suit setup rollback stopped; another animation prevented safe restoration.</text></string>
+	<string id="ui_apb_v2_suit_failed_restored"><text>Suit setup failed; previous equipment was restored.</text></string>
+	<string id="ui_apb_v2_suit_failed_incomplete"><text>Suit setup failed; rollback was incomplete.</text></string>
+	<string id="ui_apb_v2_suit_failed_foreign"><text>Suit setup failed; another animation prevented full rollback.</text></string>
+	<string id="ui_apb_v2_suit_failed_unchanged"><text>Suit setup failed; no equipment was changed.</text></string>
+	<string id="ui_apb_v2_suit_applied"><text>Suit setup applied.</text></string>
+	<string id="ui_apb_v2_suit_applied_animation_partial"><text>Suit setup applied, but an equipment animation was unavailable.</text></string>
+	<string id="ui_apb_v2_suit_applied_partial"><text>Suit setup partially applied: %d unavailable, %d rejected.</text></string>
+	<string id="ui_apb_v2_suit_verify_blocked"><text>Suit setup finished, but another animation prevented final verification.</text></string>
+	<string id="ui_apb_v2_suit_exact_missing"><text>The exact saved suit is not carried.</text></string>
+	<string id="ui_apb_v2_suit_start_blocked"><text>Suit setup could not start because another item animation did not finish.</text></string>
+	<string id="ui_apb_v2_suit_busy"><text>A suit setup switch is already in progress.</text></string>
+	<string id="ui_apb_v2_suit_lam2_missing"><text>Suit setup switching requires FDDA/LAM2.</text></string>
+	<string id="ui_apb_v2_suit_empty"><text>That suit setup is empty.</text></string>
+	<string id="ui_apb_v2_suit_already_equipped"><text>That suit setup is already equipped.</text></string>
+</string_table>

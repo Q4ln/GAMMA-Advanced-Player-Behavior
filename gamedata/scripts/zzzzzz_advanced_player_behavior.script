@@ -1,0 +1,245 @@
+-- Advanced Player Behavior v2 composition root.
+--
+-- Gameplay policy lives in small subsystem modules. This late-loading script
+-- composes them, owns the shared engine callbacks, and leaves the one raw DIK
+-- callback to apb_v2_input (Suit Setups needs a binding-independent key).
+
+local core = apb_v2_core
+local installed = false
+local callbacks_registered = false
+local shared_registered = false
+-- Event name -> the route closure registered with the engine, kept so a
+-- route can be re-registered (reassert_event_route) with the same identity.
+local routes = {}
+
+
+-- The module namespaces, in registration order.  Everything else about a
+-- module (id, priority, routes, optional dependencies, handlers) comes from
+-- the MODULE descriptor each namespace exports.
+local MODULES = {
+	"apb_v2_contextual",
+	"apb_v2_stance",
+	"apb_v2_readiness",
+	"apb_v2_freezoom",
+	"apb_v2_visor",
+	"remember_outfit_belt",
+}
+
+-- The name each module goes by in the installed log line.
+local SYSTEM_LABELS = {
+	apb_v2_contextual = "contextual-L",
+	apb_v2_stance = "stance",
+	apb_v2_readiness = "readiness",
+	apb_v2_freezoom = "freezoom",
+	apb_v2_visor = "visor",
+	remember_outfit_belt = "suit-setups",
+}
+
+-- The one MODULES entry whose filename APB shares with another mod: GAMMA's
+-- G_FLAT's Remember Belt Items ships remember_outfit_belt.script too, and APB's
+-- copy only loads when Advanced Player Behavior has the higher MO2 priority.
+local SUIT_FACADE = "remember_outfit_belt"
+
+-- Gameplay modules registered so far (namespace name -> true): a repeated
+-- on_game_start never registers one twice, and every MODULES entry missing
+-- here is reported as inactive in the installed log line.
+local composed = {}
+
+
+local function log_error(fmt, ...)
+	core.log_error("ROUTER", fmt, ...)
+end
+
+
+-- The magazine subsystem's per-frame body and its MCM speed setting, resolved
+-- once at composition instead of on every frame and every option change.
+-- axr_main loads every script before it runs any on_game_start, so both
+-- namespaces exist by then whatever their filenames sort to; an absent or
+-- uninstalled subsystem simply leaves the hook nil.
+local mags_frame, mags_option
+local mags_frame_failed = false
+
+
+local function resolve_mags_hooks()
+	local controller = rawget(_G, "zzzzzz_mags_reload_controller")
+	if type(controller) == "table" and type(controller.on_actor_frame) == "function" then
+		mags_frame = controller.on_actor_frame
+	end
+	local mcm = rawget(_G, "mags_aml_field_load_mcm")
+	if type(mcm) == "table" and type(mcm.apply_speed) == "function" then
+		mags_option = mcm.apply_speed
+	end
+end
+
+
+-- One engine actor_on_update for the whole package: APB's scheduler first, then
+-- the magazine chain.  A raising magazine frame is isolated and reported once
+-- (it would repeat every frame, so it is logged once rather than sixty times a
+-- second), and core.update keeps running on every later frame.  The core is
+-- driven only once composition succeeded: this callback is registered on both
+-- paths so the magazine subsystem keeps running when APB's own composition
+-- fails, and a core that never started must not be entered.
+local function actor_on_update()
+	if installed then core.update() end
+	if mags_frame == nil then return end
+	local ok, err = pcall(mags_frame)
+	if not ok and not mags_frame_failed then
+		mags_frame_failed = true
+		log_error("magazine frame failed: %s", tostring(err))
+	end
+end
+
+
+local function apply_mags_option()
+	if mags_option == nil then return end
+	local ok, err = pcall(mags_option)
+	if not ok then log_error("magazine option change failed: %s", tostring(err)) end
+end
+
+
+local function on_option_change(...)
+	if installed then core.option_change(...) end
+	apply_mags_option()
+end
+
+
+-- Reported when remember_outfit_belt.script is not APB's: another mod's copy
+-- won the MO2 file conflict, and its namespace exports no MODULE.  G_FLAT's
+-- file is recognised by its save_belt function; any other copy (such as the
+-- retired standalone Suit Setups package) gets the same fix.
+local function report_suit_takeover(namespace)
+	local owner = type(rawget(namespace, "save_belt")) == "function" and
+		"GAMMA's G_FLAT's Remember Belt Items" or "another mod"
+	log_error("Suit Setups is inactive: %s won the MO2 conflict for remember_outfit_belt.script, " ..
+		"so APB's Suit Setups file is not loaded. Fix: give Advanced Player Behavior a higher MO2 " ..
+		"priority than %s (place it lower in MO2's left pane), then restart the game", owner, owner)
+end
+
+
+-- Registers one gameplay module.  A failure costs that module only: it is
+-- logged, listed as inactive, and composition carries on with the rest.
+local function compose_module(name)
+	if composed[name] then return true end
+	local namespace = rawget(_G, name)
+	local spec = type(namespace) == "table" and rawget(namespace, "MODULE") or nil
+	if spec == nil and name == SUIT_FACADE and type(namespace) == "table" then
+		report_suit_takeover(namespace)
+		return false
+	end
+	if not (spec and core.register(spec, namespace)) then
+		log_error("module %s is unavailable or failed to register; continuing without it", name)
+		return false
+	end
+	composed[name] = true
+	return true
+end
+
+
+-- The core, both adapters and the input arbiter are shared by every module,
+-- so a missing one aborts composition.  A gameplay module that fails is
+-- skipped (compose_module) and the others still run.
+local function compose_modules()
+	if installed then return true end
+	if type(apb_v2_player_adapter) ~= "table" or
+		type(apb_v2_player_adapter.init) ~= "function" then
+		log_error("shared player adapter is unavailable")
+		return false
+	end
+	apb_v2_player_adapter.init(core)
+	if type(apb_v2_device_adapter) ~= "table" or
+		type(apb_v2_device_adapter.init) ~= "function" then
+		log_error("device adapter is unavailable")
+		return false
+	end
+	apb_v2_device_adapter.init(core)
+	for index = 1, #MODULES do compose_module(MODULES[index]) end
+	if type(apb_v2_input) ~= "table" or type(apb_v2_input.init) ~= "function" or
+		not apb_v2_input.init(core) then
+		log_error("shared input wrapper installation failed")
+		return false
+	end
+	installed = true
+	return true
+end
+
+
+-- Comma-separated system labels of the MODULES entries for which wanted(name)
+-- holds, in MODULES order; "none" when there are none.
+local function system_list(wanted)
+	local labels = {}
+	for index = 1, #MODULES do
+		local name = MODULES[index]
+		if wanted(name) then labels[#labels + 1] = SYSTEM_LABELS[name] or name end
+	end
+	return #labels > 0 and table.concat(labels, ",") or "none"
+end
+
+
+local function register_event_routes()
+	for _, name in ipairs(core.event_names()) do
+		local route = function(...)
+			return core.dispatch_event(name, ...)
+		end
+		routes[name] = route
+		RegisterScriptCallback(name, route)
+	end
+end
+
+
+-- Moves the stored route for one event name behind the handlers registered so
+-- far.  It is unregistered first: GAMMA's development branch keeps a handler's
+-- old position when the same function is simply registered again.  The core
+-- calls this for the mouse-wheel route at the end of every option_change
+-- (magnifier_switch re-registers its own wheel handler on each MCM change and
+-- must keep running first).
+function reassert_event_route(name)
+	local route = routes[name]
+	if route == nil then return false end
+	UnregisterScriptCallback(name, route)
+	RegisterScriptCallback(name, route)
+	return true
+end
+
+
+-- The two callbacks the vendored magazine subsystem hangs off: its per-frame
+-- body and its MCM load/unload speed.  They are registered before the
+-- composition gate, so the subsystem does not depend on APB's health: an APB
+-- failure costs APB's features and nothing else.  Both wrappers no-op the core
+-- half while composition failed.
+local function register_shared_callbacks()
+	if shared_registered then return end
+	RegisterScriptCallback("actor_on_update", actor_on_update)
+	RegisterScriptCallback("on_option_change", on_option_change)
+	shared_registered = true
+end
+
+
+local function register_callbacks()
+	if callbacks_registered then return end
+	RegisterScriptCallback("save_state", core.save_state)
+	RegisterScriptCallback("load_state", core.load_state)
+	register_event_routes()
+	core.set_route_reasserter(reassert_event_route)
+	callbacks_registered = true
+end
+
+
+function on_game_start()
+	-- The magazine hooks depend on nothing APB composes, so they are resolved
+	-- and registered first and stay live whatever happens below.
+	resolve_mags_hooks()
+	register_shared_callbacks()
+	if not compose_modules() then
+		log_error("inactive | build=%s | composition failed", tostring(core.BUILD))
+		apply_mags_option()
+		return
+	end
+	register_callbacks()
+	core.start()
+	apply_mags_option()
+	core.log_info(nil,
+		"installed | build=%s | router=deadline/event | input=single-composable | systems=%s | inactive=%s | mags=vendored",
+		tostring(core.BUILD),
+		system_list(function(name) return composed[name] end),
+		system_list(function(name) return not composed[name] end))
+end

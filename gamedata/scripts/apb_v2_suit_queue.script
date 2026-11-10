@@ -1,0 +1,511 @@
+-- Advanced Player Behavior v2: owned Suit Setups LAM2 queue sessions.
+--
+-- This module is the only place that knows how Suit actions are tagged,
+-- subscribed, inspected, invalidated, or aborted.  Only the switch service in
+-- apb_v2_suit_transaction constructs sessions, and it always injects lam2,
+-- now, wake, the mode validator and the three error reporters; a session
+-- therefore treats all of them as present and LAM2's pure accessors as total.
+
+local TAG = "apb_v2_suit"
+local STOP_EVENT = "on_anim_queue_stop"
+
+local NEUTRAL_LAM2_TAGS = {
+	["wpn_hide"] = true,
+	["show_items_in_hands"] = true,
+	["stop_lam2"] = true,
+}
+
+local REQUIRED_METHODS = {
+	"add_action",
+	"add_action_first",
+	"Subscribe",
+	"Unsubscribe",
+	"is_running",
+	"abort",
+	"get_current_action",
+	"get_all_actions",
+}
+
+local Session = {}
+Session.__index = Session
+
+-- `ready` means every operation needed for guarded switching and the watchdog
+-- is present; `missing` feeds the single user-facing LAM2-unavailable warning.
+function detect_capabilities(api)
+	local result = {
+		ready = true,
+		missing = {},
+	}
+	if type(api) ~= "table" then
+		result.ready = false
+		result.missing[1] = "lam2"
+		return result
+	end
+
+	for _, name in ipairs(REQUIRED_METHODS) do
+		if type(api[name]) ~= "function" then
+			result.ready = false
+			result.missing[#result.missing + 1] = name
+		end
+	end
+	if type(api.states) ~= "table" then
+		result.ready = false
+		result.missing[#result.missing + 1] = "states"
+	else
+		for _, name in ipairs({"success", "running", "fail"}) do
+			if api.states[name] == nil then
+				result.ready = false
+				result.missing[#result.missing + 1] = "states." .. name
+			end
+		end
+	end
+	return result
+end
+
+function new_session(options)
+	local self = setmetatable({}, Session)
+	self.api = options.lam2
+	self.now = options.now
+	self.wake = options.wake
+	self.is_mode_valid_callback = options.is_mode_valid
+	self.on_action_error = options.on_action_error
+	self.on_native_error = options.on_native_error
+	self.on_event_error = options.on_event_error
+	self.active = true
+	self.mode = nil
+	self.token = {}
+	self.subscription = nil
+	self.timer = nil
+	self.last_progress_at = self.now()
+	self.last_progress_label = "created"
+	return self
+end
+
+function Session:touch(label)
+	self.last_progress_at = self.now()
+	self.last_progress_label = tostring(label or "progress")
+end
+
+function Session:get_progress()
+	return self.last_progress_at, self.last_progress_label
+end
+
+function Session:is_stalled(timeout_ms)
+	return self.active
+		and self.mode ~= nil
+		and self.now() - self.last_progress_at >= timeout_ms
+end
+
+function Session:is_running()
+	return self.api.is_running() == true
+end
+
+function Session:is_action_valid(mode, token)
+	if not self.active or token ~= self.token or mode ~= self.mode then
+		return false
+	end
+	return self.is_mode_valid_callback(mode) == true
+end
+
+function Session:begin_queue(mode)
+	self.token = {}
+	self.mode = mode
+	self:touch(tostring(mode) .. " queue opened")
+end
+
+function Session:invalidate_actions()
+	self.token = {}
+	self.mode = nil
+	self:touch("actions invalidated")
+end
+
+function Session:report_action_error(mode, name, err)
+	pcall(self.on_action_error, mode, name, err)
+end
+
+function Session:report_event_error(name, err)
+	pcall(self.on_event_error, name, err)
+end
+
+function Session:report_native_error(label, stage, err)
+	pcall(self.on_native_error, label, stage, err)
+end
+
+function Session:success_state()
+	return self.api.states.success
+end
+
+function Session:running_state()
+	return self.api.states.running
+end
+
+function Session:fail_state()
+	return self.api.states.fail
+end
+
+function Session:enqueue(action)
+	if action then
+		action.tag = action.tag or TAG
+		action.gss_owner = self.token
+		self.api.add_action(action)
+	end
+end
+
+function Session:enqueue_first(action)
+	if action then
+		action.tag = action.tag or TAG
+		action.gss_owner = self.token
+		self.api.add_action_first(action)
+	end
+end
+
+function Session:inject_sequence(actions)
+	for index = #actions, 1, -1 do
+		self:enqueue_first(actions[index])
+	end
+end
+
+-- Forward and rollback both use these factories.  Mode and ownership are
+-- captured when the action is built, so a quickload/cancel token rotation
+-- turns every stale action into a harmless success without touching inventory.
+local function action_context(session, name)
+	local token = session.token
+	return {
+		tag = TAG,
+		gss_owner = token,
+		name = name,
+	}, token
+end
+
+function Session:direct(name, operation, mode)
+	local action, token = action_context(self, name)
+	action.enter = function()
+		if not self:is_action_valid(mode, token) then
+			return
+		end
+		self:touch(name .. " enter")
+		local ok, err = pcall(operation)
+		if not ok then
+			self:report_action_error(mode, name, err)
+		end
+	end
+	action.execute = function()
+		if self:is_action_valid(mode, token) then
+			self:touch(name .. " complete")
+		end
+		return self:success_state()
+	end
+	return action
+end
+
+function Session:checkpoint(name, predicate, timeout, timeout_handler, mode)
+	local action, token = action_context(self, name)
+	action.reported = false
+	action.execute = function(self_action, elapsed)
+		if not self:is_action_valid(mode, token) then
+			return self:success_state()
+		end
+		local ok, complete = pcall(predicate)
+		if not ok then
+			self:report_action_error(mode, name .. " check", complete)
+			self:touch(name .. " check error")
+			return self:success_state()
+		end
+		if complete then
+			if not self_action.reported then
+				self_action.reported = true
+				self:touch(name .. " passed")
+			end
+			return self:success_state()
+		end
+		if elapsed >= timeout then
+			if timeout_handler then
+				local handler_ok, handler_err = pcall(timeout_handler, name .. " did not settle")
+				if not handler_ok then
+					self:report_action_error(mode, name .. " timeout handler", handler_err)
+				end
+			else
+				self:report_action_error(mode, name, "did not settle")
+			end
+			self:touch(name .. " timed out")
+			return self:success_state()
+		end
+		return self:running_state()
+	end
+	return action
+end
+
+function Session:delay(name, duration, mode)
+	local action, token = action_context(self, name)
+	action.execute = function(_, elapsed)
+		if not self:is_action_valid(mode, token) then
+			return self:success_state()
+		end
+		if elapsed >= duration then
+			self:touch(name .. " complete")
+			return self:success_state()
+		end
+		return self:running_state()
+	end
+	return action
+end
+
+-- Returns has_owned, exclusive over the current action plus the queued list.
+function Session:inspect()
+	if not self:is_running() then
+		return false, false
+	end
+	local actions = {}
+	local current = self.api.get_current_action()
+	if current then
+		actions[#actions + 1] = current
+	end
+	local _, _, queued = self.api.get_all_actions()
+	if type(queued) ~= "table" then
+		return false, false
+	end
+	for _, action in pairs(queued) do
+		actions[#actions + 1] = action
+	end
+
+	local token = self.token
+	local has_owned = false
+	for _, action in ipairs(actions) do
+		if action.gss_owner == token then
+			has_owned = true
+			break
+		end
+	end
+	if not has_owned then
+		return false, false
+	end
+
+	for _, action in ipairs(actions) do
+		if action.gss_owner ~= token and not NEUTRAL_LAM2_TAGS[action.tag] then
+			return true, false
+		end
+	end
+	return true, true
+end
+
+-- Never aborts an unknown or mixed queue.  lam2.abort runs the current
+-- action's on_skip, i.e. third-party code, so that one call stays protected.
+function Session:abort_if_exclusive()
+	local has_owned, exclusive = self:inspect()
+	if not (has_owned and exclusive) then
+		return
+	end
+	if pcall(self.api.abort) then
+		self:touch("exclusive queue aborted")
+	end
+end
+
+function Session:guard_native_action(action, label, adopts_nvg, mode)
+	if not action or action.gss_token_guard then
+		return action
+	end
+	local token = self.token
+	local adapter = self
+	local native_enter = action.enter
+	local native_execute = action.execute
+	local native_exit = action.exit
+	action.gss_owner = token
+	action.gss_token_guard = true
+
+	action.enter = function(self_action, ...)
+		self_action.gss_started = false
+		self_action.gss_skipped = not adapter:is_action_valid(mode, token)
+		if self_action.gss_skipped then
+			return
+		end
+		self_action.gss_started = true
+		adapter:touch(label .. " enter")
+
+		local before = {}
+		if adopts_nvg then
+			local _, _, queued = adapter.api.get_all_actions()
+			for _, queued_action in pairs(queued) do
+				before[queued_action] = true
+			end
+		end
+
+		if native_enter then
+			local ok, err = pcall(native_enter, self_action, ...)
+			if not ok then
+				adapter:report_native_error(label, "enter", err)
+			end
+		end
+
+		-- FDDA's NVG entry action injects more LAM2 work.  Adopt only new,
+		-- recognized children and apply the same token guard to them.
+		if adopts_nvg then
+			local _, _, queued = adapter.api.get_all_actions()
+			for _, generated in pairs(queued) do
+				local tag = generated.tag
+				if not before[generated] and not generated.gss_owner
+					and (tag == "nvg_animation" or tag == "wait_for_seconds")
+				then
+					adapter:guard_native_action(generated, "helmet NVG", false, mode)
+				end
+			end
+		end
+	end
+
+	action.execute = function(self_action, ...)
+		if self_action.gss_skipped or not adapter:is_action_valid(mode, token) then
+			return adapter:success_state()
+		end
+		if not native_execute then
+			adapter:touch(label .. " complete")
+			return adapter:success_state()
+		end
+		local ok, result = pcall(native_execute, self_action, ...)
+		if not ok then
+			adapter:report_native_error(label, "execute", result)
+			adapter:touch(label .. " execute error")
+			return adapter:success_state()
+		end
+		if result == adapter:success_state() or result == adapter:fail_state() then
+			adapter:touch(label .. " complete")
+		end
+		return result
+	end
+
+	action.exit = function(self_action, ...)
+		if self_action.gss_started and native_exit then
+			local ok, err = pcall(native_exit, self_action, ...)
+			if not ok and adapter:is_action_valid(mode, token) then
+				adapter:report_native_error(label, "exit", err)
+			end
+		end
+		if self_action.gss_started then
+			adapter:touch(label .. " exit")
+		end
+	end
+	return action
+end
+
+local function native_action(session, name, adopts_nvg, factory, ...)
+	if not factory then
+		return nil
+	end
+	local ok, action = pcall(factory, ...)
+	if not ok then
+		session:report_native_error(name, "factory", action)
+		return nil
+	end
+	if action then
+		return session:guard_native_action(action, name, adopts_nvg, session.mode)
+	end
+	return nil
+end
+
+function Session:try_native_action(name, factory, ...)
+	return native_action(self, name, false, factory, ...)
+end
+
+-- FDDA's night-vision toggle; the children its enter injects are adopted.
+function Session:try_nvg_action(name, factory, ...)
+	return native_action(self, name, true, factory, ...)
+end
+
+function Session:subscribe(callback)
+	self:unsubscribe()
+	if not self.active then
+		return false
+	end
+	local adapter = self
+	local wrapped
+	wrapped = function(...)
+		if adapter.active and adapter.subscription == wrapped then
+			local ok, err = pcall(callback, ...)
+			if not ok then
+				adapter:report_action_error(adapter.mode, "LAM2 stop callback", err)
+			end
+		end
+	end
+	self.subscription = wrapped
+	self.api.Subscribe(STOP_EVENT, wrapped)
+	return true
+end
+
+function Session:unsubscribe()
+	local callback = self.subscription
+	self.subscription = nil
+	if callback then
+		self.api.Unsubscribe(STOP_EVENT, callback)
+	end
+end
+
+-- Named so a caller can retire exactly the timer it armed: every scheduler in
+-- the transaction removes its predecessor by name before arming the next one,
+-- and a name that is no longer the live timer must not clear a successor.
+function Session:remove_event(name)
+	if self.timer and self.timer.name == name then
+		self.timer = nil
+	end
+end
+
+-- callback returns false to keep polling and true/nil to finish. Suit timers
+-- are kept in memory and advanced only by the shared APB dispatcher; no Suit
+-- actor_on_update callback or engine time event exists while idle.
+--
+-- At most one Suit timer is live: every scheduler removes or retires its
+-- predecessor before arming the next.  The slot is emptied before the report
+-- below so an already-live foreign timer is replaced rather than silently
+-- coexisting, and so the error path cannot recurse into this function.
+function Session:schedule(name, delay, callback)
+	local displaced = self.timer
+	local interval = delay * 1000
+	self.timer = {
+		name = name,
+		callback = callback,
+		interval = interval,
+		due_at = self.now() + interval,
+	}
+	-- Report after the slot is filled: reporting reaches the transaction's
+	-- error path, which may schedule its own timer, and that timer must not be
+	-- overwritten by this call.
+	if displaced and displaced.name ~= name then
+		self:report_event_error(name, "replaced live timer " .. tostring(displaced.name))
+	end
+	self.wake(0)
+end
+
+function Session:next_delay(now)
+	if not self.active or not self.timer then return nil end
+	now = now or self.now()
+	return math.max(0, self.timer.due_at - now)
+end
+
+function Session:tick(now)
+	if not self.active then return nil end
+	now = now or self.now()
+	-- The firing timer leaves the slot before its callback runs, so a callback
+	-- that re-schedules from inside itself (the watchdog re-arming, rollback_wait
+	-- installing the next wait) owns the slot afterwards and is never retired by
+	-- this frame; the timer is put back only when the callback left the slot
+	-- empty, asked to keep polling, and the session is still open.
+	local timer = self.timer
+	if timer and timer.due_at <= now then
+		self.timer = nil
+		local ok, finished = pcall(timer.callback)
+		if not ok then
+			self:report_event_error(timer.name, finished)
+		elseif finished == false and self.active and self.timer == nil then
+			timer.due_at = now + timer.interval
+			self.timer = timer
+		end
+	end
+	return self:next_delay(now)
+end
+
+function Session:close()
+	if not self.active then
+		return
+	end
+	self:unsubscribe()
+	self.timer = nil
+	self:invalidate_actions()
+	self.active = false
+end

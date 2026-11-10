@@ -1,0 +1,294 @@
+-- Advanced Player Behavior v2: remembered binary Free Zoom for iron/non-optical ADS.
+
+local api = apb_v2_core
+local player = apb_v2_player_adapter
+local ID = "freezoom"
+
+local enabled = false
+local preferred_max = true
+local ads_active = false
+local context_key = nil
+local pending_apply = false
+local owned = false
+local owned_weapon = nil
+local native_observe = false
+local watched_key = nil
+
+
+local function log_info(fmt, ...) api.log_info("ZOOM", fmt, ...) end
+
+
+local function wake() api.wake(ID, 0) end
+
+
+local function bridge()
+	local module = rawget(_G, "free_zoomv2_mcm")
+	if type(module) ~= "table" or type(module.toggleFreezoom) ~= "function" or
+		tonumber(module.ads_mult) == nil or tonumber(module.free_zoom_mult) == nil then return nil end
+	return module
+end
+
+
+-- Free Zoom V2's native key is a DIK, not a bind: the core's DIK index routes
+-- observe_input here for that key only.  Free Zoom V2 re-publishes
+-- KEY_TOGGLE_ZOOM from its own on_option_change and the bridge may resolve
+-- late, so the watch is re-synced on option change and on every update pass;
+-- an absent bridge or key drops the watch.
+local function sync_watch()
+	local module = bridge()
+	local key = module and tonumber(module.KEY_TOGGLE_ZOOM) or nil
+	if key == watched_key then return end
+	watched_key = key
+	if key then api.watch_dik(ID, key) else api.unwatch_dik(ID) end
+end
+
+
+local function actual(module)
+	return module and api.truthy(module.freezooming, false) or false
+end
+
+
+local function toggle_to(desired)
+	local module = bridge()
+	if not module then return false, nil, nil end
+	local before = actual(module)
+	if before == desired then return true, before, before end
+	local _, ok = api.safe_call(module.toggleFreezoom)
+	local after = actual(module)
+	return ok and after == desired, before, after
+end
+
+
+-- Writes the preference into a save's m_data or the live alife storage,
+-- creating the APB root when the storage has none yet.
+local function persist(state)
+	if type(state) ~= "table" then return false end
+	local root = state[api.SAVE_ROOT]
+	if type(root) ~= "table" then
+		root = { schema = api.SAVE_SCHEMA }
+		state[api.SAVE_ROOT] = root
+	end
+	root.unscoped_free_zoom = { schema = 1, preferred_max = preferred_max and true or false }
+	return true
+end
+
+
+local function set_preference(value, reason)
+	value = value and true or false
+	local changed = preferred_max ~= value
+	preferred_max = value
+	local storage, ok = api.safe_call(alife_storage_manager and alife_storage_manager.get_state)
+	if ok then persist(storage) end
+	if changed then log_info("Preference max=%s | source=%s", tostring(value), tostring(reason or "input")) end
+end
+
+
+local function cancel_owned(reason)
+	if not owned then return end
+	toggle_to(false)
+	owned = false
+	owned_weapon = nil
+	if reason then log_info("Released owned Free Zoom | reason=%s", tostring(reason)) end
+end
+
+
+local function logical_dir(dir) return api.console_bool("mouse_wheel_invert_zoom") == true and ((dir == 1 and 0) or (dir == 0 and 1)) or tonumber(dir) end
+
+
+local function observe_native_toggle()
+	if not native_observe then return end
+	native_observe = false
+	local module = bridge()
+	if not (module and api.truthy(module.freezoom_toggleable, false)) then return end
+	owned = false
+	owned_weapon = nil
+	set_preference(actual(module), "native-toggle")
+	pending_apply = false
+end
+
+
+function init(core)
+	api = core or apb_v2_core
+end
+
+
+function on_option_change()
+	local wanted = api.get_setting("v2_unscoped_free_zoom/enabled")
+	api.set_active(ID, wanted)
+	sync_watch()
+	if wanted == enabled then return end
+	enabled = wanted
+	if not wanted then
+		reset("disabled")
+		api.sleep(ID)
+	end
+end
+
+
+-- Reached only for the watched native-key DIK (sync_watch); the core skips
+-- this module for input while it is inactive.  Only the press and release
+-- edges matter, so the per-frame hold edge returns before the bridge probe.
+function observe_input(input_phase, dik, bind, dis, ...)
+	if input_phase == "hold" then return end
+	if not enabled or dis then return end
+	local module = bridge()
+	if not module then return end
+	if api.truthy(module.freezoom_toggleable, false) then
+		if input_phase == "press" and api.confirmed_down(dik) then
+			native_observe = true
+			wake()
+		end
+	elseif input_phase == "release" then
+		pending_apply = ads_active and preferred_max
+		wake()
+	end
+end
+
+
+-- Earlier wheel consumers (Magnifier Switch's own handler among them) run
+-- before APB's route and mark the notch consumed with flags.ret_value = false;
+-- that early-out is the whole handoff.  A switched (cloned) weapon surfaces as
+-- a new snapshot id on the next update, which releases any owned Free Zoom.
+function on_mouse_wheel(dir, flags)
+	if not enabled or type(flags) ~= "table" or flags.ret_value == false then return false end
+	if not player.hud_free() then return false end
+	local snapshot = player.active_weapon()
+	-- Only idle ADS qualifies, and native variable optical magnification keeps
+	-- priority: freezoom_eligible rejects both.
+	if not player.freezoom_eligible(snapshot) or not bridge() then return false end
+	local logical = logical_dir(dir)
+	if logical == nil then return false end
+	local desired = logical == 1
+	flags.ret_value = false
+	set_preference(desired, "wheel")
+	pending_apply = false
+	if desired then
+		local settled, before = toggle_to(true)
+		if settled and not before then owned = true owned_weapon = snapshot.id end
+	else
+		toggle_to(false)
+		owned = false
+		owned_weapon = nil
+	end
+	return true
+end
+
+
+function on_update(current)
+	if not enabled then return nil end
+	sync_watch()
+	observe_native_toggle()
+	if not player.actor(true) then
+		owned = false
+		owned_weapon = nil
+		ads_active = false
+		pending_apply = false
+		return nil
+	end
+	local snapshot = player.active_weapon()
+	if not snapshot.zoomed then
+		cancel_owned("ADS-exit")
+		ads_active = false
+		context_key = nil
+		pending_apply = false
+		return nil
+	end
+	ads_active = true
+	local key = tostring(snapshot.id) .. ":" .. tostring(snapshot.zoom_type)
+	if context_key ~= key then
+		cancel_owned("aim-mode-change")
+		context_key = key
+		pending_apply = preferred_max
+	end
+	if owned and (owned_weapon ~= snapshot.id or not preferred_max) then cancel_owned("context-change") end
+	if not pending_apply then return nil end
+	local blocked, reason = player.presentation_blocked(snapshot, false)
+	if blocked then
+		cancel_owned(reason or "unsafe-context")
+	elseif snapshot.state ~= 0 then
+		return 0
+	elseif not player.freezoom_eligible(snapshot) then
+		cancel_owned("ineligible")
+	elseif preferred_max and not actual(bridge()) then
+		-- A missing bridge reads as normal zoom and cannot be toggled, so
+		-- nothing becomes owned.
+		local settled, before = toggle_to(true)
+		if settled and not before then owned = true owned_weapon = snapshot.id end
+	end
+	pending_apply = false
+	return nil
+end
+
+
+-- PlayHUDMotion fires for ADS and idle motions too: the HUD animation callbacks
+-- are declared wake-only in MODULE and never reach this handler.  Dedicated
+-- zoom/reload/item events plus polled state own cancellation.
+function on_event(name, ...)
+	if not enabled then return end
+	if name == "on_mouse_wheel" then
+		on_mouse_wheel(...)
+		return
+	end
+	if name == "actor_on_weapon_zoom_in" then
+		ads_active = true
+		context_key = nil
+		pending_apply = preferred_max
+	elseif name == "actor_on_weapon_zoom_type_changed" then
+		cancel_owned("aim-mode-event")
+		context_key = nil
+		pending_apply = preferred_max
+	elseif name == "actor_on_weapon_zoom_out" then
+		cancel_owned("ADS-exit-event")
+		ads_active = false
+		context_key = nil
+		pending_apply = false
+	elseif name == "actor_on_weapon_reload" or name == "actor_on_weapon_jammed" or
+		name == "actor_item_to_slot" or name == "actor_item_to_ruck" or name == "actor_on_changed_slot" then
+		cancel_owned(name)
+		context_key = nil
+		pending_apply = ads_active and preferred_max
+	elseif name == "load_complete" then
+		reset(name)
+	end
+	wake()
+end
+
+
+function reset(reason)
+	cancel_owned(reason)
+	ads_active = false
+	context_key = nil
+	pending_apply = false
+	native_observe = false
+end
+
+
+function load(state)
+	preferred_max = true
+	local root = api.saved_root(state)
+	local saved = root and root.unscoped_free_zoom or nil
+	if type(saved) == "table" and saved.schema == 1 and type(saved.preferred_max) == "boolean" then
+		preferred_max = saved.preferred_max
+	end
+	reset("load")
+end
+
+
+-- actor_on_before_death is not declared: a death always ends in
+-- actor_on_net_destroy or a load, and reset() runs on both.  No bind interest:
+-- the native key is a DIK watched through sync_watch.
+MODULE = {
+	id = ID,
+	priority = 300,
+	events = {
+		"actor_on_weapon_zoom_in", "actor_on_weapon_zoom_out",
+		"actor_on_weapon_zoom_type_changed", "actor_on_weapon_reload", "actor_on_weapon_jammed",
+		"actor_item_to_slot", "actor_item_to_ruck", "actor_on_changed_slot", "load_complete", "on_mouse_wheel",
+	},
+	resets = { "actor_on_net_destroy", "on_before_level_changing", "on_level_changing" },
+	wake_only = { "actor_on_first_update", "actor_on_hud_animation_play", "actor_on_hud_animation_end" },
+	handlers = {
+		init = init, option_change = on_option_change, update = on_update, event = on_event,
+		reset = reset, save = persist, load = load, observe = observe_input,
+	},
+}

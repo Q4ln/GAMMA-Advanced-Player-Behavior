@@ -1,0 +1,496 @@
+-- Advanced Player Behavior v2: Suit Setups inventory manager.
+-- The registry, the runtime and persistence live behind remember_outfit_belt;
+-- the shared row presentation lives in apb_v2_suit_ui. This module owns no
+-- engine callbacks and reads the facade at call time only, because the facade
+-- binds this namespace at load time.
+
+local ui = apb_v2_suit_ui
+local REFRESH_INTERVAL = 200
+local ROW_TEMPLATE = "form:row_template"
+local ROW_X = 14
+local ROW_Y = 63
+local ROW_STEP = 44
+-- utils_ui grid unit for the suit icon cell; a 2x3 outfit fits the 48-unit box.
+local ICON_GRID = 13
+-- The name text colour in the layout, which ready names keep.
+local NAME_COLOR = GetARGB(255, 200, 200, 200)
+-- UI units either side of a name that still count as a click on it.
+local NAME_SLOP = 4
+
+-- Renaming has no button: a click on the selected row's name starts it.
+local ACTION_BUTTONS = {
+	{"btn_save", "OnSave"},
+	{"btn_apply", "OnApply"},
+	{"btn_delete", "OnDelete"},
+	{"btn_close", "Close"},
+}
+
+GUI = nil
+
+
+local function inventory_outfit(obj, bag, mode)
+	if not (obj and db.actor and mode == "inventory") then
+		return false
+	end
+	if bag ~= "actor_bag" and bag ~= "actor_equ" then
+		return false
+	end
+	local parent = obj:parent()
+	return parent and parent:id() == db.actor:id() and IsOutfit(obj) and true or false
+end
+
+
+class "APBV2SuitManager" (CUIScriptWnd)
+
+function APBV2SuitManager:__init() super()
+	self:InitControls()
+	self:InitCallbacks()
+end
+
+function APBV2SuitManager:__finalize()
+	GUI = nil
+end
+
+function APBV2SuitManager:InitControls()
+	self:SetWndRect(Frect():set(0, 0, 1024, 768))
+	self:SetAutoDelete(true)
+
+	self.xml = CScriptXmlInit()
+	self.xml:ParseFile("apb_v2_suit_manager.xml")
+
+	local form = self.xml:InitStatic("form", self)
+	self.form = form
+	self.xml:InitStatic("form:background", form)
+	self.xml:InitTextWnd("form:title", form)
+	self.xml:InitFrame("form:list_frame", form)
+
+	-- The inventory's toggle wash, moved behind the selected row.
+	self.selection_frame = self.xml:InitStatic("form:selection_frame", form)
+	self.selection_frame:Show(false)
+
+	self.rows = {}
+	for i = 1, remember_outfit_belt.SLOT_COUNT do
+		local container = self.xml:InitStatic(ROW_TEMPLATE, form)
+		container:SetWndPos(vector2():set(ROW_X, ROW_Y + ((i - 1) * ROW_STEP)))
+		-- Built first so its hover wash is drawn under the icon and the text.
+		local button = self.xml:Init3tButton(ROW_TEMPLATE .. ":button", container)
+		local icon = ui.new_suit_cell("apb_v2_suit_row_" .. i, self, ROW_TEMPLATE .. ":cont_item", container, ICON_GRID)
+		-- icon_key plus the last_* fields below are Refresh's change guards;
+		-- they start empty here and with them every first Refresh writes.
+		local row = {
+			id = "row_" .. i,
+			container = container,
+			icon = icon,
+			icon_key = false,
+			name = self.xml:InitTextWnd(ROW_TEMPLATE .. ":name", container),
+			button = button,
+		}
+		self:Register(row.button, row.id)
+		self.rows[i] = row
+	end
+
+	self.action_enabled = {}
+	for _, spec in ipairs(ACTION_BUTTONS) do
+		local id = spec[1]
+		self[id] = self.xml:Init3tButton("form:" .. id, form)
+		self:Register(self[id], id)
+	end
+
+	self.edit_panel = self.xml:InitStatic("form:name_editor", form)
+	-- Two layers of the stash rename box's art, so no row text shows through.
+	self.xml:InitStatic("form:name_editor:background", self.edit_panel)
+	self.xml:InitStatic("form:name_editor:background", self.edit_panel)
+	self.xml:InitTextWnd("form:name_editor:caption", self.edit_panel)
+	self.name_input = self.xml:InitEditBox("form:name_editor:input", self.edit_panel)
+	self:Register(self.name_input, "name_input")
+	self:Register(self.xml:Init3tButton("form:name_editor:btn_accept", self.edit_panel), "btn_name_accept")
+	self:Register(self.xml:Init3tButton("form:name_editor:btn_cancel", self.edit_panel), "btn_name_cancel")
+	self.edit_panel:Show(false)
+
+	self.confirm = CUIMessageBoxEx()
+	self:Register(self.confirm, "confirm")
+end
+
+function APBV2SuitManager:InitCallbacks()
+	for i = 1, remember_outfit_belt.SLOT_COUNT do
+		self:AddCallback(self.rows[i].id, ui_events.BUTTON_CLICKED, function(owner)
+			owner:OnRowClicked(i)
+		end, self)
+	end
+
+	for _, spec in ipairs(ACTION_BUTTONS) do
+		self:AddCallback(spec[1], ui_events.BUTTON_CLICKED, self[spec[2]], self)
+	end
+
+	self:AddCallback("btn_name_accept", ui_events.BUTTON_CLICKED, self.OnNameAccept, self)
+	self:AddCallback("btn_name_cancel", ui_events.BUTTON_CLICKED, self.CancelNameEdit, self)
+
+	self:AddCallback("confirm", ui_events.MESSAGE_BOX_YES_CLICKED, self.OnConfirmYes, self)
+	self:AddCallback("confirm", ui_events.MESSAGE_BOX_NO_CLICKED, self.OnConfirmNo, self)
+	self:AddCallback("confirm", ui_events.MESSAGE_BOX_OK_CLICKED, self.OnConfirmNo, self)
+end
+
+function APBV2SuitManager:ShowManager()
+	self.closing = false
+	self.next_refresh = 0
+	self:Refresh(true)
+	self:ShowDialog(true)
+	Register_UI("APBV2SuitManager", "apb_v2_suit_manager")
+end
+
+-- One action button, written only when its enabled state actually changed.
+function APBV2SuitManager:EnableAction(id, enabled)
+	if self.action_enabled[id] == enabled then
+		return
+	end
+	self.action_enabled[id] = enabled
+	self[id]:Enable(enabled)
+end
+
+-- Runs five times a second while the dialog is open, so every widget write
+-- below is guarded by the value last written to that widget. The guards live
+-- on the row and on self, both of which are rebuilt with the dialog.
+function APBV2SuitManager:Refresh(force_selection)
+	local slot_count = remember_outfit_belt.SLOT_COUNT
+	local view = remember_outfit_belt.get_slots_view()
+	-- Only the selection decision reads this scan, so it runs when a selection
+	-- is actually being made rather than on every 200 ms refresh.
+	if force_selection or not self.selected_slot then
+		local first_occupied, equipped_slot, empty_slot = nil, nil, nil
+		for i = 1, slot_count do
+			local slot = view.slots[i]
+			if not slot.occupied then
+				empty_slot = empty_slot or i
+			else
+				first_occupied = first_occupied or i
+				if slot.status == remember_outfit_belt.STATUS_EQUIPPED then
+					equipped_slot = equipped_slot or i
+				end
+			end
+		end
+		self.selected_slot = equipped_slot or first_occupied or empty_slot
+	end
+	self.busy = view.busy == true
+	self.view = view
+	local editing = self.edit_mode ~= nil
+	local rows_enabled = not self.busy and not editing
+
+	for i = 1, slot_count do
+		local slot = view.slots[i]
+		local row = self.rows[i]
+		if rows_enabled ~= row.last_enabled then
+			row.last_enabled = rows_enabled
+			row.button:Enable(rows_enabled)
+		end
+		-- An empty slot shows no name. The guard compares the shown text,
+		-- because a slot saved under its default name keeps the same name it
+		-- had while empty. The window is fitted to the text, so a click can tell
+		-- the name from the rest of the row.
+		local shown_name = slot.occupied and slot.name or ""
+		if shown_name ~= row.last_name then
+			row.last_name = shown_name
+			row.name:SetText(shown_name)
+			row.name:AdjustWidthToText()
+		end
+		-- The name's colour is the status, as on the wheel: ready names stay
+		-- plain and the others take their status colour.
+		if slot.status ~= row.last_status then
+			row.last_status = slot.status
+			row.name:SetTextColor(slot.status == remember_outfit_belt.STATUS_READY and NAME_COLOR
+				or ui.STATUS_COLOR[slot.status])
+		end
+
+		local section = slot.suit_section
+		local obj = slot.suit_object
+		local icon_key = section and (section .. (obj and ("+" .. obj:id()) or "-")) or false
+		if icon_key ~= row.icon_key then
+			row.icon_key = icon_key
+			if section then
+				ui.show_suit(row.icon, obj, section)
+				ui.hide_badges(row.icon)
+			else
+				row.icon:AddItemManual(nil, nil, 1)
+			end
+		end
+	end
+
+	local selected_row = self.selected_slot and self.rows[self.selected_slot] or nil
+	if selected_row then
+		if self.selected_slot ~= self.framed_slot then
+			self.framed_slot = self.selected_slot
+			self.selection_frame:SetWndPos(selected_row.container:GetWndPos())
+		end
+		if self.framed_shown ~= true then
+			self.framed_shown = true
+			self.selection_frame:Show(true)
+		end
+	elseif self.framed_shown ~= false then
+		self.framed_shown = false
+		self.selection_frame:Show(false)
+	end
+
+	-- Section 9.2: a busy transaction or name editing disables every action.
+	local selected_view = self.selected_slot and view.slots[self.selected_slot] or nil
+	local available = not editing and not self.busy and selected_view ~= nil
+	self:EnableAction("btn_save", available and (selected_view.can_save == true or selected_view.can_overwrite == true))
+	self:EnableAction("btn_apply", available and selected_view.can_apply == true)
+	self:EnableAction("btn_delete", available and selected_view.can_delete == true)
+	self:EnableAction("btn_close", not editing)
+end
+
+function APBV2SuitManager:Update()
+	CUIScriptWnd.Update(self)
+	if not self:IsShown() then
+		return
+	end
+
+	if self.edit_mode then
+		local text = tostring(self.name_input:GetText() or "")
+		local clipped = remember_outfit_belt.sanitize_name_live(text)
+		if clipped ~= text then
+			self.name_input:SetText(clipped)
+		end
+	end
+
+	local now = time_global()
+	if now >= self.next_refresh then
+		self.next_refresh = now + REFRESH_INTERVAL
+		self:Refresh(false)
+	end
+end
+
+function APBV2SuitManager:SelectSlot(index)
+	if self.edit_mode or self.busy then
+		return
+	end
+	self.selected_slot = index
+	self:Refresh(false)
+end
+
+-- As in a file list: a click on the selected row's name renames it, and any
+-- other click on a row selects that row.
+function APBV2SuitManager:OnRowClicked(index)
+	if index == self.selected_slot and self:CursorOnName(self.rows[index]) then
+		self:OnRename()
+	else
+		self:SelectSlot(index)
+	end
+end
+
+-- Only the drawn name counts, not the icon or the space after a short name.
+-- The dialog covers the screen from 0,0, so the cursor is in the form's
+-- parent coordinates. An empty row cannot be renamed, so its zero width
+-- needs no case of its own.
+function APBV2SuitManager:CursorOnName(row)
+	local x = GetCursorPosition().x - self.form:GetWndPos().x
+		- row.container:GetWndPos().x - row.name:GetWndPos().x
+	return x >= -NAME_SLOP and x <= row.name:GetWidth() + NAME_SLOP
+end
+
+function APBV2SuitManager:BeginNameEdit(mode, slot, value)
+	if self.busy or self.edit_mode then
+		return
+	end
+	self.edit_mode = mode
+	self.edit_slot = slot
+	self.name_input:SetText(remember_outfit_belt.sanitize_name_live(value))
+	self.edit_panel:Show(true)
+	self.name_input:CaptureFocus(true)
+	self:Refresh(false)
+end
+
+function APBV2SuitManager:CancelNameEdit()
+	if not self.edit_mode then
+		return
+	end
+	self.name_input:CaptureFocus(false)
+	self.edit_panel:Show(false)
+	self.edit_mode = nil
+	self.edit_slot = nil
+	self:Refresh(false)
+end
+
+-- The selected slot and its view row, only while that row allows `capability`.
+function APBV2SuitManager:SelectedRow(capability)
+	local slot = self.selected_slot
+	local row = slot and self.view and self.view.slots[slot] or nil
+	if row and row[capability] then
+		return slot, row
+	end
+end
+
+-- One button for both: an empty row asks for a name, a saved row asks before
+-- its contents are replaced and keeps its name.
+function APBV2SuitManager:OnSave()
+	local slot = self:SelectedRow("can_save")
+	if slot then
+		-- Starts empty: an empty name is saved as the slot number.
+		self:BeginNameEdit("save", slot, "")
+	else
+		self:AskConfirmation("overwrite", "can_overwrite", "ui_apb_v2_suit_confirm_overwrite")
+	end
+end
+
+function APBV2SuitManager:OnNameAccept()
+	if not (self.edit_mode and self.edit_slot) then
+		return
+	end
+
+	local mode = self.edit_mode
+	local slot = self.edit_slot
+	local name = self.name_input:GetText()
+	local ok = false
+	if mode == "save" then
+		ok = remember_outfit_belt.save_slot(slot, name)
+	elseif mode == "rename" then
+		ok = remember_outfit_belt.rename_slot(slot, name)
+	end
+
+	if not ok then
+		self:ShowOperationFailed()
+		return
+	end
+
+	self.selected_slot = slot
+	self:CancelNameEdit()
+end
+
+function APBV2SuitManager:OnApply()
+	local slot = self:SelectedRow("can_apply")
+	if not slot then
+		return
+	end
+
+	self:Close()
+	hide_hud_inventory()
+	remember_outfit_belt.apply_slot(slot)
+end
+
+function APBV2SuitManager:OnRename()
+	local slot, row = self:SelectedRow("can_rename")
+	if slot then
+		self:BeginNameEdit("rename", slot, row.name)
+	end
+end
+
+function APBV2SuitManager:OnDelete()
+	self:AskConfirmation("delete", "can_delete", "ui_apb_v2_suit_confirm_delete")
+end
+
+function APBV2SuitManager:AskConfirmation(action, capability, text_id)
+	local slot, row = self:SelectedRow(capability)
+	if not slot then
+		return
+	end
+	self.pending_action = {action = action, slot = slot}
+	self.confirm:InitMessageBox("message_box_yes_no")
+	self.confirm:SetText(strformat(game.translate_string(text_id), row.name))
+	self.confirm:ShowDialog(true)
+end
+
+function APBV2SuitManager:OnConfirmYes()
+	local pending = self.pending_action
+	self.pending_action = nil
+	if not pending then
+		return
+	end
+
+	local ok = false
+	if pending.action == "overwrite" then
+		ok = remember_outfit_belt.overwrite_slot(pending.slot)
+	elseif pending.action == "delete" then
+		ok = remember_outfit_belt.delete_slot(pending.slot)
+	end
+
+	if not ok then
+		self:ShowOperationFailed()
+		return
+	end
+
+	self.selected_slot = pending.slot
+	self:Refresh(false)
+end
+
+function APBV2SuitManager:OnConfirmNo()
+	self.pending_action = nil
+end
+
+function APBV2SuitManager:ShowOperationFailed()
+	self.pending_action = nil
+	self.confirm:InitMessageBox("message_box_ok")
+	self.confirm:SetText(game.translate_string("ui_apb_v2_suit_operation_failed"))
+	self.confirm:ShowDialog(true)
+end
+
+function APBV2SuitManager:OnKeyboard(dik, keyboard_action)
+	-- The engine sends a click to the window as a key too, after the button has
+	-- acted on it. Passed on to the name box, the release of the click on Save
+	-- or on a name would end its typing focus at once, so clicks stop here while
+	-- a name is edited; the buttons have already received them as mouse actions.
+	if self.edit_mode and (dik == DIK_keys.MOUSE_1 or dik == DIK_keys.MOUSE_2) then
+		return true
+	end
+	if keyboard_action == ui_events.WINDOW_KEY_PRESSED then
+		if self.edit_mode and (dik == DIK_keys.DIK_RETURN or dik == DIK_keys.DIK_NUMPADENTER) then
+			self:OnNameAccept()
+			return true
+		elseif self.edit_mode and dik == DIK_keys.DIK_ESCAPE then
+			self:CancelNameEdit()
+			return true
+		elseif dik == DIK_keys.DIK_ESCAPE then
+			self:Close()
+			return true
+		end
+	end
+	return CUIScriptWnd.OnKeyboard(self, dik, keyboard_action)
+end
+
+function APBV2SuitManager:Close()
+	if self.closing then
+		return
+	end
+	self.closing = true
+	-- A confirmation or a name being edited closes with the manager, so the
+	-- next open starts clean.
+	self.confirm:HideDialog()
+	self.pending_action = nil
+	if self.edit_mode then
+		self.name_input:CaptureFocus(false)
+		self.edit_panel:Show(false)
+		self.edit_mode = nil
+		self.edit_slot = nil
+	end
+	if self:IsShown() then
+		self:HideDialog()
+	end
+	Unregister_UI("APBV2SuitManager")
+end
+
+
+function open_manager()
+	if GUI and GUI:IsShown() then
+		return
+	end
+	if not GUI then
+		GUI = APBV2SuitManager()
+	end
+	GUI:ShowManager()
+end
+
+
+function reset()
+	if GUI then
+		GUI:Close()
+	end
+	GUI = nil
+end
+
+
+-- Called once by the Suit facade during init. Stock Mode_Custom/Cont_Custom
+-- gating applies; inventory_outfit narrows the entry to actor-owned outfits.
+function register_functor()
+	if not custom_functor_autoinject then return false end
+	custom_functor_autoinject.add_functor("apb_v2_suit_setups", inventory_outfit,
+		function() return "ui_apb_v2_suit_menu" end, nil, open_manager)
+	return true
+end

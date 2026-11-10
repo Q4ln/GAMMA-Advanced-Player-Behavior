@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+    <string id="ui_mcm_menu_advanced_player_behavior"><text>Расширенное поведение игрока</text></string>
+
+    <string id="ui_apb_mcm_stance_controls"><text>Управление стойками</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_enabled"><text>Включить управление стойками</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_enabled_desc"><text>Использовать приседание и прыжок для управления стойкой, приседом и самой низкой стандартной стойкой без дополнительной клавиши.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_hold_threshold_ms"><text>Порог удержания (миллисекунды)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_stance_controls_hold_threshold_ms_desc"><text>Отпускание раньше этого времени считается нажатием. Достижение порога считается удержанием. По умолчанию: 250 мс.</text></string>
+
+    <string id="ui_apb_mcm_weapon_readiness"><text>Адаптивная готовность оружия</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_enabled"><text>Включить адаптивную готовность</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_enabled_desc"><text>Опускать поддерживаемое оружие в мирной обстановке и поднимать его при бое, вражеской атаке, прицеливании или стрельбе.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_calm_delay_ms"><text>Задержка успокоения (миллисекунды)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_weapon_readiness_calm_delay_ms_desc"><text>Держать оружие поднятым указанное время после исчезновения последнего сигнала готовности, затем опустить при первом безопасном состоянии покоя. По умолчанию: 2000 мс.</text></string>
+
+    <string id="ui_apb_mcm_smart_visor_wiping"><text>Умное протирание визора</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_enabled"><text>Включить умное протирание визора</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_enabled_desc"><text>Запрашивать установленное стандартное протирание, когда капли дождя достигают заданного уровня. Бой, поднятое бездействующее оружие и спринт не блокируют запрос.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_trigger_percent"><text>Порог протирания (проценты)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_trigger_percent_desc"><text>Поставить протирание в очередь при достижении общей влажностью визора этого значения. По умолчанию: 30%.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_rearm_percent"><text>Уровень повторного взведения (проценты)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_rearm_percent_desc"><text>Перед следующим автоматическим протиранием влажность должна снизиться до этого значения. Оно автоматически сохраняется минимум на 5 пунктов ниже порога. По умолчанию: 10%.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_min_interval_seconds"><text>Минимальный интервал (секунды)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_smart_visor_wiping_min_interval_seconds_desc"><text>Минимальное время после завершённого автоматического или ручного протирания до следующего автоматического. По умолчанию: 30 секунд.</text></string>
+
+    <string id="ui_apb_mcm_contextual_equipment"><text>Контекстное управление снаряжением</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_enabled"><text>Включить контекстное управление</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_enabled_desc"><text>Назначить клавише фонаря контекстные нажатие и удержание для фонаря, ПНВ, режимов прицеливания, вариантов прицела и цвета лазера BAS.</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_hold_threshold_ms"><text>Порог удержания снаряжения (миллисекунды)</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_contextual_equipment_hold_threshold_ms_desc"><text>Отпустите раньше этого времени для контекстного нажатия. Достижение порога выполняет действие удержания. По умолчанию: 350 мс.</text></string>
+
+    <string id="ui_apb_mcm_unscoped_free_zoom"><text>Свободное увеличение без оптики</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_unscoped_free_zoom_enabled"><text>Включить Free Zoom без оптики</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_unscoped_free_zoom_enabled_desc"><text>Запоминать обычное или максимальное увеличение для точно определённых основных прицельных приспособлений без оптики и неоптических альтернативных режимов. Выбор общий для текущего сохранения.</text></string>
+
+    <string id="ui_apb_mcm_suit_setups"><text>Комплекты костюма</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_suit_setups_open_wheel"><text>Колесо комплектов костюма</text></string>
+    <string id="ui_mcm_advanced_player_behavior_v2_suit_setups_open_wheel_desc"><text>Удерживайте клавишу для открытия колеса из восьми комплектов. Наведите мышь и щёлкните по готовому или неполному комплекту. По умолчанию не назначено.</text></string>
+    <string id="ui_apb_mcm_suit_setups_manager_note"><text>Менеджер комплектов доступен через любой принадлежащий актёру костюм. Замедление колеса следует настройкам Haru Quick Action Wheel.</text></string>
+
+</string_table>

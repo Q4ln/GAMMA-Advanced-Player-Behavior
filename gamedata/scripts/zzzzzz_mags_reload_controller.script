@@ -1,0 +1,1620 @@
+-- Unified Reload gesture, ammo selector, field motions and cosmetic
+-- chamber-extraction controller of Advanced Player Behavior's magazine
+-- subsystem; all permanent Mags reload/ejection hooks live here, installed
+-- while scripts load.  A Reload edge passes APB's arbiter (apb_v2_input, which
+-- wraps level_input in the composition root's on_game_start), then this
+-- controller, then stock level_input and its on_before_key_press listeners,
+-- Mags' handler among them.  Fixed filename; see zzz_mags_compat_core.
+local SELECTOR_OPEN_RETRY_MS, SELECTOR_BUSY_WATCHDOG_MS, RELEASE_TOMBSTONE_MS = 1500, 10000, 500
+-- Capture the native Mags wheel before Haru QAW can replace its public entry
+-- point during on_game_start.
+local native_start_ammo_wheel = item_weapon and item_weapon.start_ammo_wheel or nil
+local api = apb_v2_core
+local core = zzz_mags_compat_core
+local assignment = zzzz_mags_assignment_service
+local aml = zzzzz_mags_aml_bridge
+local log_info, log_error, pack_results, object_id = core.log_info, core.log_error, core.pack_results, core.object_id
+local now_ms, get_setting, active_weapon = core.now_ms, core.get_setting, core.active_weapon
+local readiness_query = core.readiness
+local BUILD = core.BUILD
+-- `this` is this script's own namespace table; the AML bridge reaches the
+-- controller through the compat core registry instead of a raw global.
+core.register_service("reload", this)
+local original, installed, callbacks_registered, marker_logged, inactive_logged = {}, false, false, false, false
+local gesture, wheel, selector, release_tombstone, wheel_cancel_dik
+local intent, delay_scope_id, field_motion
+local replay_depth, replay_key = 0, nil
+local chamber_abort, safety_skip_logged = {}, {}
+local motion_mark_original, motion_mark_wrapper
+local auto_reload_status = "unknown"
+local auto_reload_notice, auto_reload_error_logged, auto_reload_enforcing = false, false, false
+local next_auto_reload_check = 0
+-- api.safe_method returns (value, ok, err); this keeps the (ok, value) order
+-- its call sites destructure, and the error text they log.
+local function call_method(object, name, ...)
+	local value, ok, err = api.safe_method(object, name, ...)
+	if ok then return true, value end
+	return false, err or "method unavailable"
+end
+-- api.safe_call for the pcall isolation, but not api.truthy: truthy folds the
+-- strings "false"/"off"/"0" to false, where this treats any non-nil, non-false
+-- value as true and normalises numbers only.
+local function safe_bool(fn, ...)
+	local value, ok = api.safe_call(fn, ...)
+	if ok and type(value) == "number" then value = value ~= 0 end
+	return ok and value and true or false, ok
+end
+local function animation_active()
+	return intent and (intent.phase == "prepare" or intent.phase == "play" or intent.phase == "wait" or intent.phase == "commit")
+end
+-- Publishes whether the chamber prelude holds the weapon (read by readiness
+-- through api.flag): its scripted motion plays at weapon state 0, which
+-- readiness would otherwise take for an idle weapon and lower.
+local MOTION_OWNER, MOTION_FLAG = "mags_reload_controller", "weapon_motion"
+local function publish_motion() api.set_flag(MOTION_OWNER, MOTION_FLAG, animation_active() and true or nil) end
+-- api.console_bool's first probe is get_console_cmd(1, name), which _g.script
+-- defines as get_console():get_bool(name); g_auto_reload is a boolean console
+-- variable, so it comes back as the boolean the console holds.
+local function read_auto_reload()
+	local value = api.console_bool("g_auto_reload")
+	if type(value) ~= "boolean" then return nil, "g_auto_reload unavailable" end
+	return value
+end
+local function enforce_manual_reload(source)
+	if auto_reload_enforcing then return auto_reload_status ~= "error" end
+	local enabled, read_err = read_auto_reload()
+	if enabled == false then
+		if auto_reload_status ~= "forced_off" then auto_reload_status = "off" end
+		auto_reload_error_logged = false
+		return true
+	end
+	local failure
+	if enabled == nil then
+		failure = string.format("could not read engine auto-reload option | source=%s | %s", tostring(source), tostring(read_err))
+	else
+		auto_reload_enforcing = true
+		local ok, err = false, "console setter unavailable"
+		if type(exec_console_cmd) == "function" then ok, err = pcall(exec_console_cmd, "g_auto_reload 0") end
+		if not ok and type(get_console) == "function" then
+			local console_ok, console = pcall(get_console)
+			if console_ok then ok, err = call_method(console, "execute", "g_auto_reload 0") end
+		end
+		local verified, verify_err = read_auto_reload()
+		auto_reload_enforcing = false
+		if verified == false then
+			auto_reload_status, auto_reload_error_logged = "forced_off", false
+			if not auto_reload_notice then
+				auto_reload_notice = true
+				log_info("disabled engine auto-reload | source=%s", tostring(source))
+			end
+			return true
+		end
+		failure = string.format("could not disable engine auto-reload | source=%s | set_ok=%s | set=%s | verified=%s | verify=%s",
+			tostring(source), tostring(ok), tostring(err), tostring(verified), tostring(verify_err))
+	end
+	auto_reload_status = "error"
+	if not auto_reload_error_logged then auto_reload_error_logged = true; log_error("%s", failure) end
+	return false
+end
+local function same_active_weapon(expected_id)
+	local weapon = active_weapon(); return weapon and object_id(weapon) == expected_id and weapon or nil
+end
+-- Not the player adapter's hud_free(): that returns true when
+-- actor_menu.is_hud_free is absent, where this returns false.  Fail-closed is
+-- the contract every caller below relies on.
+local function hud_is_free()
+	local actor = db and db.actor
+	if not actor then return false end
+	if level and type(level.present) == "function" then
+		local ok, present = pcall(level.present)
+		if not (ok and present) then return false end
+	end
+	if type(device) == "function" then
+		local ok, current = pcall(device)
+		local paused
+		if ok then ok, paused = call_method(current, "is_paused") end
+		if ok and paused then return false end
+	end
+	local alive_ok, alive = call_method(actor, "alive")
+	if not (alive_ok and alive) then return false end
+	if not (actor_menu and type(actor_menu.is_hud_free) == "function") then return false end
+	local ok, value = pcall(actor_menu.is_hud_free)
+	return ok and value and true or false
+end
+local function readiness(weapon, expected_id)
+	local ok, state = pcall(readiness_query, weapon, expected_id)
+	if ok and type(state) == "string" then return state end
+	return "wpo_query_failed"
+end
+local JAM_ROUTE = {wpo_jam = true, wpo_query_failed = true, unjam_guard = true, engine_misfire = true, query_failed = true}
+local function detachable_supported(weapon)
+	local binder = magazine_binder
+	local supports = binder and binder.is_supported_weapon
+	if not weapon or type(supports) ~= "function" then return false end
+	local ok, value = pcall(supports, weapon)
+	if not ok then
+		log_error("detachable support query failed | weapon_id=%s | %s", tostring(object_id(weapon)), tostring(value))
+		return nil
+	end
+	if not value then return false end
+	if type(binder.get_mags_for_weapon) == "function" then
+		local choices
+		ok, choices = pcall(binder.get_mags_for_weapon, weapon)
+		if not ok then
+			log_error("detachable magazine query failed | weapon_id=%s | %s", tostring(object_id(weapon)), tostring(choices))
+			return nil
+		end
+		return type(choices) == "table" and #choices > 0
+	end
+	return false
+end
+local function cleanup_mags(interrupt)
+	if interrupt and magazines and type(magazines.do_interrupt) == "function" then pcall(magazines.do_interrupt) end
+	if mag_reload_speed and type(mag_reload_speed.clear_pending_mag) == "function" then pcall(mag_reload_speed.clear_pending_mag) end
+end
+-- Replays Reload through level_input past this controller (replay_depth), so
+-- the native chain receives it as ordinary input.
+local function replay_native(dik, release)
+	local previous = replay_key
+	replay_depth = replay_depth + 1
+	replay_key = dik
+	local press_ok, press_err = pcall(level.press_action, dik)
+	local release_ok, release_err = true, nil
+	if release then release_ok, release_err = pcall(level.release_action, dik) end
+	replay_depth = math.max(0, replay_depth - 1)
+	replay_key = replay_depth > 0 and previous or nil
+	if not press_ok then log_error("Reload press replay failed: %s", tostring(press_err)) end
+	if not release_ok then log_error("Reload release replay failed: %s", tostring(release_err)) end
+	return press_ok and release_ok
+end
+local function canonical_reload(fallback)
+	local dik = fallback
+	if type(bind_to_dik) == "function" and key_bindings then
+		local ok, rebound = pcall(bind_to_dik, key_bindings.kWPN_RELOAD)
+		if ok and rebound ~= nil then dik = rebound end
+	end
+	if dik == nil or not (level and type(level.press_action) == "function" and type(level.release_action) == "function") then return false end
+	return replay_native(dik, true)
+end
+-- An up-state press that no release followed within its input batch came from
+-- a script's level.press_action: hand it to the native chain unchanged.  Under
+-- GAMMA's Unjam Reload layout that is every Reload, so it is logged once.
+local pass_through_logged = false
+local function pass_through_press(state)
+	if not (level and type(level.press_action) == "function") then return false end
+	if not pass_through_logged then
+		pass_through_logged = true
+		log_info("Reload press passed through | weapon_id=%s | reason=no release in its input frame (logged once)", tostring(state.weapon_id))
+	end
+	return replay_native(state.dik, false)
+end
+local function loaded_mag_data(id)
+	local getter = magazines and magazines.get_mag_loaded
+	if type(getter) ~= "function" then return false, nil end
+	local ok, data = pcall(getter, id)
+	return ok, data ~= false and data or nil
+end
+local function validated_magazine(weapon, id, section, ammo_section, require_carried, data)
+	if not (weapon and id and section and ammo_section and level and type(level.object_by_id) == "function" and
+		magazine_binder and type(magazine_binder.is_compatible) == "function") then return nil end
+	local object_ok, obj = pcall(level.object_by_id, id)
+	if not object_ok or not obj then return nil end
+	local section_ok, current_section = call_method(obj, "section")
+	local parent_ok, parent = call_method(obj, "parent")
+	local id_ok, parent_id = call_method(parent, "id")
+	local owned = parent_ok and id_ok and parent_id == AC_ID
+	local compatible_ok, compatible = pcall(magazine_binder.is_compatible, weapon, obj)
+	if data == nil then
+		local data_ok
+		data_ok, data = loaded_mag_data(id)
+		if not data_ok then return nil end
+	end
+	local rounds = type(data) == "table" and data.loaded or nil
+	if not section_ok or current_section ~= section or not owned or not compatible_ok or not compatible or type(data) ~= "table" or
+		data.section ~= section or type(rounds) ~= "table" or #rounds == 0 or rounds[#rounds] ~= ammo_section then return nil end
+	if require_carried and type(magazine_binder.is_carried_mag) == "function" then
+		local carried_ok, carried = pcall(magazine_binder.is_carried_mag, id)
+		if not carried_ok or not carried then return nil end
+	end
+	return obj, #rounds
+end
+local function exact_selected_magazine(weapon, ammo_section)
+	if not (weapon and ammo_section and magazine_binder and type(magazine_binder.get_carried_mags) == "function" and
+		type(magazine_binder.is_compatible) == "function") then return nil end
+	local carried = {}
+	if not pcall(magazine_binder.get_carried_mags, carried) then return nil end
+	local best, best_id, best_count = nil, nil, -1
+	for id, data in pairs(carried) do
+		local loaded = type(data) == "table" and data.loaded or nil
+		local count = type(loaded) == "table" and #loaded or 0
+		if count > 0 and loaded[count] == ammo_section then
+			local obj = validated_magazine(weapon, id, data.section, ammo_section, true, data)
+			if obj and (count > best_count or count == best_count and (best_id == nil or id < best_id)) then best, best_id, best_count = obj, id, count end
+		end
+	end
+	return best, best_count
+end
+local function current_magazine_rounds(weapon)
+	local ok, data = loaded_mag_data(object_id(weapon))
+	if not (ok and data and data.section ~= "no_mag" and type(data.loaded) == "table") then return 0 end
+	local count = #data.loaded
+	if count > 0 and safe_bool(magazines and magazines.retain_round, weapon) then count = count - 1 end
+	return math.max(0, count)
+end
+local function retained_chamber_section(weapon)
+	if not (magazines and type(magazines.retain_round) == "function" and type(magazines.get_sec_chambered) == "function") then
+		return false, nil end
+	local ok, retain = pcall(magazines.retain_round, weapon)
+	if not ok then return false, nil end
+	if not retain then return true, nil end
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	if not count_ok or type(count) ~= "number" then return false, nil end
+	if count <= 0 then return true, nil end
+	local sec_ok, section = pcall(magazines.get_sec_chambered, weapon)
+	return sec_ok and section ~= nil, sec_ok and section or nil
+end
+local function logical_chamber_valid(weapon, data, section, count, embed_id)
+	if data and (type(data.section) ~= "string" or type(data.loaded) ~= "table") then return false end
+	if data then
+		local ok, compatible = pcall(magazine_binder.is_compatible, weapon, data.section)
+		if not ok or not compatible then return false end
+	end
+	if not section then return true end
+	if not data then return count == 1 end
+	local rounds = data.loaded
+	if #rounds > 0 then return rounds[#rounds] == section end
+	if count ~= 1 then return false end
+	if embed_id == nil then return true end
+	local setter = magazines and magazines.set_mag_data
+	if type(setter) ~= "function" then return false end
+	rounds[1] = section
+	if not pcall(setter, embed_id, data) then
+		rounds[1] = nil
+		return false
+	end
+	log_info("embedded engine-only chamber | weapon_id=%s | ammo=%s", tostring(embed_id), tostring(section))
+	return true
+end
+local function outgoing_mag_valid(weapon, state)
+	local ok, data = loaded_mag_data(state.weapon_id)
+	return ok and data and data.section == state.outgoing_section and type(data.loaded) == "table" and
+		#data.loaded == state.outgoing_count and logical_chamber_valid(weapon, data, state.expected_chamber, state.expected_count)
+end
+local function return_chamber_round(weapon, chamber_section, selected_section)
+	if not chamber_section or chamber_section == selected_section then return true end
+	if type(alife_create_item) ~= "function" or not (db and db.actor) then return false end
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	if not count_ok or count ~= 1 then
+		log_error("refused ambiguous chamber return | weapon_id=%s | count=%s", tostring(object_id(weapon)), tostring(count))
+		return false
+	end
+	if not call_method(weapon, "set_ammo_elapsed", 0) then return false end
+	local verify_ok, remaining = call_method(weapon, "get_ammo_in_magazine")
+	if not verify_ok or remaining ~= 0 then
+		call_method(weapon, "set_ammo_elapsed", 1)
+		return false
+	end
+	local spawn_ok, spawned = pcall(alife_create_item, chamber_section, db.actor, {ammo = 1})
+	if not spawn_ok or not spawned then
+		call_method(weapon, "set_ammo_elapsed", 1)
+		log_error("failed to return chamber round | weapon_id=%s | ammo=%s | %s", tostring(object_id(weapon)), tostring(chamber_section), tostring(spawned))
+		return false
+	end
+	log_info("returned chamber round | weapon_id=%s | ammo=%s | selected=%s", tostring(object_id(weapon)), tostring(chamber_section), tostring(selected_section))
+	return true
+end
+-- Companion services export their handlers to these dispatchers; the shared
+-- engine callbacks stay registered while a permanent host hook is inactive.
+-- Two dispatchers, one error contract.  service_caller packs the pcall results
+-- so a call site can consume a return value; service_notify is the same
+-- dispatch for the calls whose result is discarded -- a plain pcall that
+-- forwards `...` without a per-call table, since three of them run every frame.
+local function service_caller(service, label)
+	return function(name, ...)
+		local fn = service and service[name]
+		if type(fn) ~= "function" then return nil end
+		local results = pack_results(pcall(fn, ...))
+		if not results[1] then
+			log_error("%s %s failed: %s", label, tostring(name), tostring(results[2]))
+			return nil
+		end
+		return unpack(results, 2, results.n)
+	end
+end
+local function service_notify(service, label, name, ...)
+	local fn = service and service[name]
+	if type(fn) ~= "function" then return end
+	local ok, err = pcall(fn, ...)
+	if not ok then log_error("%s %s failed: %s", label, tostring(name), tostring(err)) end
+end
+local function service_notifier(service, label)
+	return function(name, ...) return service_notify(service, label, name, ...) end
+end
+local assignment_call = service_caller(assignment, "assignment")
+local aml_call = service_caller(aml, "AML callback")
+local core_notify = service_notifier(core, "core callback")
+local assignment_notify = service_notifier(assignment, "assignment")
+local aml_notify = service_notifier(aml, "AML callback")
+local function callback_for(name, ...)
+	local calls = {...}
+	return function(...)
+		for i = 1, #calls do calls[i](name, ...) end
+	end
+end
+local actor_on_hud_animation_end = callback_for("on_hud_animation_end", core_notify)
+local actor_on_weapon_reload = callback_for("on_weapon_reload", core_notify)
+local on_save_state = callback_for("on_save_state", aml_notify, assignment_notify)
+local on_load_state = callback_for("on_load_state", aml_notify, assignment_notify)
+local function force_jam_tap(state, weapon, always_interrupt)
+	if not (weapon and JAM_ROUTE[readiness(weapon, object_id(weapon))]) then return false end
+	local was_long = state.long
+	state.tap_only, state.force_canonical, state.long = true, true, false
+	if was_long or always_interrupt then aml_notify("interrupt") end
+	return true
+end
+local function fail_chamber_transaction(id, reason)
+	if intent and intent.weapon_id == id then intent = nil end
+	cleanup_mags(true)
+	log_error("aborted selected reload chamber transaction | weapon_id=%s | %s", tostring(id), tostring(reason))
+	if delay_scope_id == id then error(chamber_abort, 0) end
+end
+local function wrapped_eject_magazine(weapon, ...)
+	local id = object_id(weapon)
+	local pending = intent and intent.phase == "awaiting_eject" and intent.weapon_id == id and not intent.mags_owned and
+		delay_scope_id == id and type(intent.pre_table) == "table" and intent or nil
+	if pending then
+		local exact = validated_magazine(weapon, pending.incoming_id, pending.incoming_section, pending.selected_section, false)
+		if not exact or not same_active_weapon(id) or not safe_bool(magazines and magazines.action_in_progress) or
+			not outgoing_mag_valid(weapon, pending) or now_ms() > pending.deadline then
+			fail_chamber_transaction(id, "commit revalidation failed before ejection")
+			pending = nil
+		end
+	end
+	local token = assignment_call("before_eject", weapon)
+	local results = pack_results(pcall(original.eject_magazine, weapon, ...))
+	assignment_call("after_eject", weapon, token, results[1], results[2])
+	if pending and (not results[1] or results[2] == nil) then
+		fail_chamber_transaction(id, "canonical ejection failed")
+	elseif pending and pending.chamber_section and not pending.chamber_done then
+		if results[1] and results[2] and return_chamber_round(weapon, pending.chamber_section, pending.selected_section) then
+			pending.chamber_done = true
+			pending.expected_chamber, pending.expected_count = nil, 0
+			if type(pending.pre_table) == "table" then
+				local sec = pending.chamber_section
+				pending.pre_table[sec] = (tonumber(pending.pre_table[sec]) or 0) + 1
+			end
+		else
+			fail_chamber_transaction(id, "canonical ejection/chamber return failed")
+		end
+	end
+	if pending and intent == pending then pending.mags_owned = true end
+	if not results[1] then
+		if pending and intent == pending then fail_chamber_transaction(id, "canonical ejection raised: " .. tostring(results[2])) end
+		error(results[2], 0)
+	end
+	return unpack(results, 2, results.n)
+end
+local function wrapped_timer_eject_magazine(weapon_id, id, mag_data, ...)
+	local extra = pack_results(...)
+	local function call_timer()
+		return original.timer_eject_magazine(weapon_id, id, mag_data, unpack(extra, 1, extra.n))
+	end
+	local force_retain = aml_call("force_retain_ejected_magazine", weapon_id, id) == true
+	local results
+	if force_retain and magazines and type(magazines.retain_magazine) == "function" and
+		magazine_binder and type(magazine_binder.room_in_pouch) == "function" then
+		local native_retain, native_room = magazines.retain_magazine, magazine_binder.room_in_pouch
+		local function retain_exact(candidate_id, ...)
+			if candidate_id == id then return true end
+			return native_retain(candidate_id, ...)
+		end
+		local function room_for_exact(candidate_id, ...)
+			if candidate_id == id then return true end
+			return native_room(candidate_id, ...)
+		end
+		local function with_room_override()
+			return core.scoped_override(magazine_binder, "room_in_pouch", room_for_exact, call_timer)
+		end
+		results = pack_results(pcall(core.scoped_override, magazines, "retain_magazine",
+			retain_exact, with_room_override))
+	else
+		if force_retain then
+			log_error("held-magazine retention APIs unavailable | weapon_id=%s | magazine_id=%s",
+				tostring(weapon_id), tostring(id))
+		end
+		results = pack_results(pcall(call_timer))
+	end
+	assignment_call("after_timer_eject", weapon_id, id, mag_data, results[1], results[2])
+	if not results[1] then error(results[2], 0) end
+	return unpack(results, 2, results.n)
+end
+local function wrapped_load_weapon(weapon, magazine, ...)
+	local pending = intent and intent.phase == "awaiting_eject" and intent.mags_owned and intent.weapon_id == object_id(weapon) and intent or nil
+	if pending and (pending.cancel_commit or object_id(magazine) ~= pending.incoming_id or now_ms() > pending.deadline or
+		not validated_magazine(weapon, pending.incoming_id, pending.incoming_section, pending.selected_section, false)) then
+		log_error("cancelled invalid selected magazine commit | weapon_id=%s | magazine_id=%s", tostring(pending.weapon_id), tostring(pending.incoming_id))
+		cleanup_mags(true)
+		return
+	end
+	local token = assignment_call("before_load_weapon", weapon, magazine)
+	local results = pack_results(pcall(original.load_weapon, weapon, magazine, ...))
+	assignment_call("after_load_weapon", weapon, magazine, token, results[1], unpack(results, 2, results.n))
+	if not results[1] then error(results[2], 0) end
+	if pending then
+		local loaded_ok, loaded = loaded_mag_data(pending.weapon_id)
+		local rounds = loaded and loaded.loaded or nil
+		if not loaded_ok or type(rounds) ~= "table" or #rounds == 0 or rounds[#rounds] ~= pending.selected_section then
+			cleanup_mags(true)
+			log_error("selected magazine commit was not installed | weapon_id=%s", tostring(pending.weapon_id))
+		end
+	end
+	return unpack(results, 2, results.n)
+end
+local function wrapped_delay_load_weapon(id, magazine, pre_table, ...)
+	local previous = delay_scope_id
+	delay_scope_id = id
+	local pending = intent and intent.phase == "awaiting_eject" and intent.weapon_id == id and intent or nil
+	if pending then
+		pending.pre_table = pre_table
+		local weapon = same_active_weapon(id)
+		local host_ok = weapon and safe_bool(magazines and magazines.action_in_progress) and type(pre_table) == "table" and now_ms() <= pending.deadline
+		if not pending.needs_eject and pending.expected_count == 0 and not pending.initial_zeroed and host_ok then
+			local zero_ok = call_method(weapon, "set_ammo_elapsed", 0)
+			local verify_ok, remaining = call_method(weapon, "get_ammo_in_magazine")
+			if zero_ok and verify_ok and remaining == 0 then
+				if pending.manual_returned then pre_table[pending.manual_returned] = (tonumber(pre_table[pending.manual_returned]) or 0) + 1 end
+				pending.initial_zeroed = true
+			else
+				host_ok = false
+				log_error("could not preserve binderless reload state | weapon_id=%s", tostring(id))
+			end
+		end
+		local exact = host_ok and object_id(magazine) == pending.incoming_id and
+			validated_magazine(weapon, pending.incoming_id, pending.incoming_section, pending.selected_section, false)
+		local state_ok = pending.mags_owned or host_ok and outgoing_mag_valid(weapon, pending)
+		if not host_ok or not exact or not state_ok then
+			if pending.mags_owned and host_ok then
+				pending.cancel_commit = true
+				if not pending.cancel_logged then
+					pending.cancel_logged = true
+					log_error("selected magazine invalid after ejection | weapon_id=%s | magazine_id=%s", tostring(id), tostring(pending.incoming_id))
+				end
+			else
+				intent = nil
+				cleanup_mags(true)
+				log_error("aborted selected reload chamber transaction | weapon_id=%s | delayed reload revalidation failed", tostring(id))
+			end
+		end
+	end
+	local results = pack_results(pcall(original.delay_load_weapon, id, magazine, pre_table, ...))
+	delay_scope_id = previous
+	if not results[1] then
+		if results[2] == chamber_abort then
+			if magazines and type(magazines.do_interrupt) == "function" then pcall(magazines.do_interrupt) end
+			local cleanup_ok, cleanup_err = pcall(original.delay_load_weapon, id, magazine, pre_table, ...)
+			if not cleanup_ok then log_error("Mags delayed cleanup failed | weapon_id=%s | %s", tostring(id), tostring(cleanup_err)) end
+			cleanup_mags(false)
+			return true
+		end
+		error(results[2], 0)
+	end
+	if results[2] and intent and intent.weapon_id == id and intent.phase == "awaiting_eject" then intent = nil end
+	return unpack(results, 2, results.n)
+end
+local function start_selected_mag_reload(state)
+	local weapon = same_active_weapon(state.weapon_id)
+	if not weapon or readiness(weapon, state.weapon_id) ~= "healthy" then return false end
+	local magazine = validated_magazine(weapon, state.incoming_id, state.incoming_section, state.selected_section, true)
+	if not magazine then return false end
+	local chamber_ok, chamber_section = retained_chamber_section(weapon)
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	if not chamber_ok or chamber_section ~= state.expected_chamber or not count_ok or count ~= state.expected_count then return false end
+	local loaded_ok, loaded = loaded_mag_data(state.weapon_id)
+	if not loaded_ok or not logical_chamber_valid(weapon, loaded, chamber_section, count, state.weapon_id) then return false end
+	state.phase = "awaiting_eject"
+	state.needs_eject = loaded ~= nil
+	state.manual_return = not state.needs_eject and count == 1 and chamber_section and chamber_section ~= state.selected_section or false
+	if loaded then state.outgoing_section, state.outgoing_count = loaded.section, #loaded.loaded end
+	state.chamber_done = not (chamber_section and chamber_section ~= state.selected_section)
+	state.deadline = now_ms() + 60000
+	intent = state
+	if mag_bone_hider and type(mag_bone_hider.begin_reload) == "function" then pcall(mag_bone_hider.begin_reload, weapon) end
+	local ok, err = pcall(core.scoped_override, magazines, "find_magazine", function() return magazine end,
+		magazines.actor_on_weapon_reload, db.actor, weapon, 0)
+	if not ok or not safe_bool(magazines and magazines.action_in_progress) then
+		intent = nil
+		if magazines and type(magazines.do_interrupt) == "function" then pcall(magazines.do_interrupt) end
+		call_method(weapon, "switch_state", 2)
+		cleanup_mags(false)
+		if not ok then log_error("selected Mags reload failed | weapon_id=%s | %s", tostring(state.weapon_id), tostring(err)) end
+		return false
+	end
+	if state.manual_return then
+		if not return_chamber_round(weapon, chamber_section, state.selected_section) then
+			intent = nil
+			pcall(magazines.do_interrupt)
+			call_method(weapon, "switch_state", 2)
+			cleanup_mags(false)
+			return false
+		end
+		state.manual_returned, state.chamber_done = chamber_section, true
+		state.expected_chamber, state.expected_count = nil, 0
+	end
+	if not state.needs_eject then state.mags_owned = true end
+	log_info("selected magazine reload | weapon_id=%s | magazine_id=%s | ammo=%s",
+		tostring(state.weapon_id), tostring(state.incoming_id), tostring(state.selected_section))
+	return true
+end
+local play_configured_motion_sound, play_field_motion_sound, stop_state_sound
+-- HUD alias candidates in order of preference: plain, and with a grenade
+-- launcher attached.
+local MISFIRE_ALIASES = {plain = {"anm_reload_misfire"}, gl = {"anm_reload_misfire_w_gl"}}
+local FIELD_ALIASES = {plain = {"anm_reload"}, gl = {"anm_reload_w_gl", "anm_reload"}}
+local FIELD_EMPTY_ALIASES = {plain = {"anm_reload_empty", "anm_reload"},
+	gl = {"anm_reload_empty_w_gl", "anm_reload_w_gl", "anm_reload_empty", "anm_reload"}}
+-- The weapon's first authored candidate that is not a firing motion.  A
+-- section that discharges on misfire or loads from stripper clips, or whose
+-- flags cannot be read, gets none: nil, the section and that reason.
+local function cosmetic_alias(weapon, aliases)
+	if not (ini_sys and type(ini_sys.r_string_ex) == "function") then return nil end
+	local section_ok, section = call_method(weapon, "section")
+	if not section_ok then return nil end
+	if type(ini_sys.r_bool_ex) == "function" then
+		local discharge_ok, discharge = call_method(ini_sys, "r_bool_ex", section, "discharge_on_misfire", false)
+		local stripper_ok, stripper = call_method(ini_sys, "r_bool_ex", section, "stripper_clip", false)
+		if not (discharge_ok and stripper_ok) then return nil, section, "flags unreadable" end
+		if discharge or stripper then return nil, section, discharge and "discharge_on_misfire" or "stripper_clip" end
+	end
+	local gl = false
+	if utils_item and type(utils_item.addon_attached) == "function" then
+		local ok, attached = pcall(utils_item.addon_attached, weapon, "gl")
+		if not ok then return nil, section end
+		gl = attached and true or false
+	end
+	local hud = ini_sys:r_string_ex(section, "hud")
+	if not hud then return nil, section end
+	local candidates = gl and aliases.gl or aliases.plain
+	for i = 1, #candidates do
+		local value = ini_sys:r_string_ex(hud, candidates[i])
+		if type(value) == "string" and not string.find(string.lower(value), "shoot", 1, true) then
+			return candidates[i], section
+		end
+	end
+	return nil, section
+end
+local function motion_marks_guarded()
+	return motion_mark_wrapper and _G.CHudItem__OnMotionMark == motion_mark_wrapper
+end
+function prepare_field_eject(weapon_id, magazine_section)
+	if field_motion or intent or safe_bool(magazines and magazines.action_in_progress) then
+		return "retry", "reload controller is busy"
+	end
+	local weapon = same_active_weapon(weapon_id)
+	if not weapon or readiness(weapon, weapon_id) ~= "healthy" then return "failed", "exact weapon is not ready" end
+	local data_ok, data = loaded_mag_data(weapon_id)
+	local chamber_ok, chamber = retained_chamber_section(weapon)
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	if not (data_ok and type(data) == "table" and data.section == magazine_section and
+		type(data.loaded) == "table" and chamber_ok and count_ok and
+		logical_chamber_valid(weapon, data, chamber, count, weapon_id)) then
+		return "failed", "installed magazine or chamber state is ambiguous"
+	end
+	if type(count) ~= "number" or count ~= #data.loaded then
+		return "failed", "engine and logical magazine counts differ"
+	end
+	return "ready"
+end
+local drs_motion_wrapper, drs_sound_wrapper
+local function owns_drs_mags_ammo(anim_table, object)
+	local state = intent
+	if not (state and state.mode == "mag" and state.phase == "awaiting_eject" and
+		object_id(object) == state.weapon_id) then return false end
+	local name = type(anim_table) == "table" and string.lower(tostring(anim_table.anm_name or "")) or ""
+	local family = string.sub(name, 1, 10) == "anm_reload" or
+		string.sub(name, 1, 17) == "anm_add_cartridge" or
+		string.sub(name, 1, 8) == "anm_open" or string.sub(name, 1, 9) == "anm_close"
+	if not family or string.find(name, "misfire", 1, true) then return false end
+	local ok, grenade = call_method(object, "weapon_in_grenade_mode")
+	if type(grenade) == "number" then grenade = grenade ~= 0 end
+	return ok and not grenade
+end
+local function clear_drs_ammo_events()
+	if type(RemoveTimeEvent) ~= "function" then return end
+	pcall(RemoveTimeEvent, "ver_reload_sound", "set_ammo_elapsed")
+	pcall(RemoveTimeEvent, "ver_reload_sound", "set_ammo_elapsed2")
+end
+local function install_drs_motion_guard()
+	local drs = ver_dynamic_reload_speeds
+	-- Dynamic Reload Speeds is optional: only a loaded DRS without these
+	-- entry points is a mismatch worth reporting.
+	if drs ~= nil then
+		core.record_seam("ver_dynamic_reload_speeds.change_reload_animation_speed",
+			core.missing_member(drs, "ver_dynamic_reload_speeds", { "change_reload_animation_speed" }))
+		core.record_seam("ver_dynamic_reload_speeds.remove_sound",
+			core.missing_member(drs, "ver_dynamic_reload_speeds", { "remove_sound" }))
+	end
+	if not (drs and type(drs.change_reload_animation_speed) == "function") then return false end
+	if drs.__mags_field_motion_guard == BUILD and drs.change_reload_animation_speed == drs_motion_wrapper and
+		(drs_sound_wrapper == nil or drs.remove_sound == drs_sound_wrapper) then return true end
+	local previous_motion = drs.change_reload_animation_speed
+	drs_motion_wrapper = function(anim_table, object, ...)
+		local state = field_motion
+		if state and object_id(object) == state.weapon_id then return end
+		-- DRS still owns animation speed, camera, and sound timing. Mags owns
+		-- the exact detachable-magazine stack, so remove only DRS's late
+		-- SetAmmoElapsed writers after it has finished configuring the motion.
+		local owns_ammo = owns_drs_mags_ammo(anim_table, object)
+		local results = pack_results(pcall(previous_motion, anim_table, object, ...))
+		if owns_ammo then clear_drs_ammo_events() end
+		if not results[1] then error(results[2], 0) end
+		return unpack(results, 2, results.n)
+	end
+	drs.change_reload_animation_speed = drs_motion_wrapper
+	if type(drs.remove_sound) == "function" then
+		local previous_sound = drs.remove_sound
+		drs_sound_wrapper = function(...)
+			if field_motion then return end
+			return previous_sound(...)
+		end
+		drs.remove_sound = drs_sound_wrapper
+	end
+	drs.__mags_field_motion_guard = BUILD
+	return true
+end
+-- DRS registers these function values during on_game_start.  Wrap them while
+-- scripts are loading so the callback registry captures the guarded owners;
+-- replacing the public fields only when a bookend starts would be too late.
+install_drs_motion_guard()
+-- Cosmetic only: binder/ammunition state remains installed and unchanged.
+function start_field_reload_motion(weapon_id, magazine_section, empty, bookend)
+	if not installed then return "failed", "reload controller is not installed" end
+	if not motion_marks_guarded() then return "failed", "motion-mark guard is unavailable" end
+	if ver_dynamic_reload_speeds and type(ver_dynamic_reload_speeds.change_reload_animation_speed) == "function" and
+		not install_drs_motion_guard() then return "failed", "DRS field-motion guard is unavailable" end
+	if field_motion then
+		if field_motion.weapon_id == weapon_id and field_motion.bookend == bookend then return "started" end
+		return "retry", "another field reload motion is settling"
+	end
+	if intent or wheel or selector or gesture and not gesture.long then return "retry", "Reload controller is busy" end
+	if safe_bool(magazines and magazines.action_in_progress) then return "retry", "Mags action is busy" end
+	local direct_ok, weapon = pcall(function() return db and db.actor and db.actor:active_item() or nil end)
+	if not (direct_ok and weapon and object_id(weapon) == weapon_id) then return "retry", "exact weapon is not active" end
+	local ready = readiness(weapon, weapon_id)
+	if ready ~= "healthy" then
+		if ready == "weapon_busy" or ready == "mags_busy" then return "retry", ready end
+		return "failed", ready
+	end
+	local data = core.data_for(weapon_id)
+	if not (type(data) == "table" and data.is_weapon and data.section == magazine_section and
+		type(data.loaded) == "table") then return "failed", "exact magazine is not installed" end
+	local alias, weapon_section = cosmetic_alias(weapon, empty and FIELD_EMPTY_ALIASES or FIELD_ALIASES)
+	if not alias then return "skipped", "compatible reload animation is unavailable" end
+	local state = {weapon_id = weapon_id, magazine_section = magazine_section,
+		bookend = bookend, alias = alias, weapon_section = weapon_section,
+		started_at = now_ms(), play_callback_pending = true}
+	field_motion = state
+	cleanup_mags(false)
+	-- State zero and original speed make this a visual-only motion. DRS is
+	-- guarded above because its reload callback also schedules ammo changes.
+	local ok, duration = call_method(weapon, "play_hud_motion", alias, true, 0, 1, 0)
+	state.play_callback_pending = false
+	if not ok or type(duration) ~= "number" or duration <= 0 or duration > 65000 then
+		cleanup_mags(false)
+		field_motion = nil
+		call_method(weapon, "switch_state", 2)
+		return "failed", "reload animation could not play"
+	end
+	if field_motion ~= state then return "failed", "reload animation was replaced during startup" end
+	state.finish_at = state.started_at + duration
+	if not state.motion_seen then
+		field_motion = nil
+		cleanup_mags(false)
+		call_method(weapon, "switch_state", 2)
+		return "failed", "reload animation callback was not observed"
+	end
+	play_field_motion_sound(state)
+	log_info("field reload motion started | phase=%s | weapon_id=%s | animation=%s | empty=%s | sound=%s",
+		tostring(bookend), tostring(weapon_id), tostring(alias), tostring(empty and true or false),
+		tostring(state.sound_source or "none"))
+	return "started"
+end
+function field_reload_motion_status(weapon_id, bookend)
+	local state = field_motion
+	if not (state and state.weapon_id == weapon_id and state.bookend == bookend) then return "failed", "not owned" end
+	local weapon, data = same_active_weapon(weapon_id), core.data_for(weapon_id)
+	if not weapon or not (type(data) == "table" and data.is_weapon and
+		data.section == state.magazine_section and type(data.loaded) == "table") then
+		stop_state_sound(state)
+		field_motion = nil
+		cleanup_mags(false)
+		return "failed", "exact installed magazine or active weapon changed"
+	end
+	if not state.completed and now_ms() < state.finish_at then return "running" end
+	if not state.motion_seen then
+		stop_state_sound(state)
+		field_motion = nil
+		cleanup_mags(false)
+		return "failed", "reload animation callback was not observed"
+	end
+	state.sound = nil -- Successful authored audio may finish its natural tail.
+	field_motion = nil
+	cleanup_mags(false)
+	log_info("field reload motion complete | phase=%s | weapon_id=%s | animation=%s",
+		tostring(bookend), tostring(weapon_id), tostring(state.resolved_alias or state.alias))
+	return "complete"
+end
+function cancel_field_reload_motion(weapon_id, bookend)
+	local state = field_motion
+	if not (state and (weapon_id == nil or state.weapon_id == weapon_id) and
+		(bookend == nil or state.bookend == bookend)) then return false end
+	stop_state_sound(state)
+	field_motion = nil
+	cleanup_mags(false)
+	local weapon = same_active_weapon(state.weapon_id)
+	if weapon then call_method(weapon, "switch_state", 2) end
+	log_info("field reload motion cancelled | phase=%s | weapon_id=%s", tostring(state.bookend), tostring(state.weapon_id))
+	return true
+end
+function prepare_field_reinsert(weapon_id, magazine_id, magazine_section)
+	if field_motion or intent or safe_bool(magazines and magazines.action_in_progress) then return "retry", "reload controller is busy" end
+	local weapon = same_active_weapon(weapon_id)
+	if not weapon and level and type(level.object_by_id) == "function" then
+		local ok, candidate = pcall(level.object_by_id, weapon_id)
+		if ok and object_id(candidate) == weapon_id then weapon = candidate end
+	end
+	if not weapon or readiness(weapon, weapon_id) ~= "healthy" then return "retry", "exact weapon is not ready" end
+	local weapon_data, magazine_data = core.data_for(weapon_id), core.data_for(magazine_id)
+	local rounds = type(magazine_data) == "table" and not magazine_data.is_weapon and magazine_data.loaded or nil
+	local selected = type(rounds) == "table" and rounds[#rounds] or nil
+	if not (type(weapon_data) == "table" and weapon_data.is_weapon and weapon_data.section == "no_mag" and
+		type(weapon_data.loaded) == "table" and selected and
+		validated_magazine(weapon, magazine_id, magazine_section, selected, true, magazine_data)) then
+		return "failed", "exact loose magazine or no_mag weapon state changed"
+	end
+	local chamber_ok, chamber = retained_chamber_section(weapon)
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	if not chamber_ok or not count_ok or not logical_chamber_valid(weapon, nil, chamber, count) then
+		return "failed", "ambiguous chamber before exact reinsertion"
+	end
+	if chamber and chamber ~= selected then
+		if not return_chamber_round(weapon, chamber, selected) then return "failed", "mismatched chamber return failed" end
+		chamber = nil
+	end
+	return "ready", chamber == nil, chamber
+end
+local function start_selected_engine_reload(state)
+	local weapon = same_active_weapon(state.weapon_id)
+	if not weapon then return false end
+	local ready = readiness(weapon, state.weapon_id)
+	if ready ~= "healthy" then
+		if JAM_ROUTE[ready] then canonical_reload() end
+		return false
+	end
+	local ok, current = call_method(weapon, "get_ammo_type")
+	if not ok then return false end
+	if state.staged_chamber then
+		local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+		if not count_ok or count ~= 1 or current ~= state.original_index then
+			log_info("cancelled staged engine reload after chamber changed | weapon_id=%s", tostring(state.weapon_id))
+			intent = nil
+			return false
+		end
+	end
+	if current ~= state.selected_index then
+		local unload_ok, unload_err = call_method(weapon, "unload_magazine", true)
+		if not unload_ok then
+			log_error("selected engine unload failed | weapon_id=%s | %s", tostring(state.weapon_id), tostring(unload_err))
+			return false
+		end
+		local set_ok, set_err = call_method(weapon, "set_ammo_type", state.selected_index)
+		if not set_ok then
+			log_error("selected engine ammo type failed | weapon_id=%s | %s", tostring(state.weapon_id), tostring(set_err))
+			return false
+		end
+	end
+	intent = nil
+	log_info("selected engine reload | weapon_id=%s | ammo=%s | changed=%s",
+		tostring(state.weapon_id), tostring(state.selected_section), tostring(current ~= state.selected_index))
+	return canonical_reload()
+end
+play_configured_motion_sound = function(state, primary, fallback)
+	if not (state and sound_object and ini_sys and type(ini_sys.r_string_ex) == "function" and
+		state.weapon_section and state.alias) then return false end
+	local scripted = (state.resolved_alias or state.alias):gsub("^anm_", "scripted_snd_")
+	if ini_sys:r_string_ex(state.weapon_section, scripted) ~= nil then
+		state.sound_source = scripted
+		return true
+	end
+	local source, value = primary, ini_sys:r_string_ex(state.weapon_section, primary)
+	if value == nil and fallback then source, value = fallback, ini_sys:r_string_ex(state.weapon_section, fallback) end
+	if not value or value == "$no_sound" then return false end
+	local parts = type(str_explode) == "function" and str_explode(value, ",") or {value}
+	local path = parts and parts[1] or nil
+	if not path or path == "" then return false end
+	local ok, sound = pcall(function() return sound_object(path) end)
+	if not ok or not sound or not pcall(function() sound:play(db.actor, 0, sound_object.s2d) end) then return false end
+	local volume = tonumber(parts[2])
+	if volume then pcall(function() sound.volume = volume end) end
+	state.sound, state.sound_source = sound, source
+	return true
+end
+play_field_motion_sound = function(state)
+	local resolved = string.lower(state.resolved_alias or state.alias)
+	local key = string.find(resolved, "^anm_reload_g") and "snd_reload_grenade" or
+		string.find(resolved, "empty", 1, true) and "snd_reload_empty" or
+		string.find(resolved, "1", 1, true) and "snd_reload_1" or "snd_reload"
+	return play_configured_motion_sound(state, key, key ~= "snd_reload" and "snd_reload" or nil)
+end
+stop_state_sound = function(state)
+	local sound = state and state.sound
+	if state then state.sound = nil end
+	if sound then pcall(function() if sound:playing() then sound:stop() end end) end
+end
+local function cancel_intent(reason)
+	local state = intent
+	if not state or state.phase == "awaiting_eject" then return end
+	intent = nil
+	stop_state_sound(state)
+	log_info("chamber prelude cancelled | weapon_id=%s | %s", tostring(state.weapon_id), tostring(reason))
+end
+local function complete_animation(reason)
+	local state = intent
+	if not state or state.phase ~= "wait" then return end
+	state.phase, state.commit_at = "commit", now_ms() + 50
+	log_info("chamber prelude completed | weapon_id=%s | animation=%s | via=%s", tostring(state.weapon_id), tostring(state.alias), tostring(reason))
+end
+local function stage_animation(state)
+	local weapon = same_active_weapon(state.weapon_id)
+	if not get_setting("chamber_animation", true) or not weapon then return false end
+	local alias, section, safety = cosmetic_alias(weapon, MISFIRE_ALIASES)
+	if safety and not safety_skip_logged[section] then
+		safety_skip_logged[section] = true
+		log_info("cosmetic animation skipped | section=%s | safety=%s", tostring(section), safety)
+	end
+	if not alias or not motion_marks_guarded() then return false end
+	local now = now_ms()
+	state.phase, state.alias, state.weapon_section = "prepare", alias, section
+	state.next_at, state.deadline = now + 1, now + 1500
+	intent = state
+	publish_motion()
+	cleanup_mags(false)
+	return true
+end
+local function start_or_stage_mag_reload(weapon, magazine, selected_section)
+	local id, incoming_id = object_id(weapon), object_id(magazine)
+	if id == nil or incoming_id == nil then return false end
+	local section_ok, incoming_section = pcall(function() return magazine:section() end)
+	if not section_ok or not incoming_section then return false end
+	if not validated_magazine(weapon, incoming_id, incoming_section, selected_section, true) then return false end
+	local chamber_ok, chamber = retained_chamber_section(weapon)
+	if not chamber_ok then return false end
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	if not count_ok then return false end
+	local loaded_ok, loaded = loaded_mag_data(id)
+	if not loaded_ok then return false end
+	local recoverable_empty = not loaded
+	if loaded and type(loaded.section) == "string" and type(loaded.loaded) == "table" and #loaded.loaded == 0 then
+		local ok, compatible = pcall(magazine_binder.is_compatible, weapon, loaded.section)
+		recoverable_empty = ok and compatible and true or false
+	end
+	if recoverable_empty and count > 0 and (count > 1 or not chamber) then
+		local unload_ok = call_method(weapon, "unload_magazine", true)
+		local verify_ok, remaining = call_method(weapon, "get_ammo_in_magazine")
+		if not unload_ok or not verify_ok or remaining ~= 0 then
+			log_error("could not recover ambiguous engine-only ammo | weapon_id=%s | count=%s", tostring(id), tostring(count))
+			return false
+		end
+		log_info("recovered ambiguous engine-only ammo | weapon_id=%s | count=%s", tostring(id), tostring(count))
+		chamber, count = nil, 0
+	elseif not logical_chamber_valid(weapon, loaded, chamber, count) then
+		return false
+	end
+	local state = {mode = "mag", weapon_id = id, incoming_id = incoming_id, incoming_section = incoming_section,
+		selected_section = selected_section, chamber_section = chamber, expected_chamber = chamber, expected_count = count}
+	if chamber and chamber ~= selected_section and stage_animation(state) then return true end
+	return start_selected_mag_reload(state)
+end
+local function legacy_gui_shown()
+	local gui = item_weapon and item_weapon.GUI
+	if not gui then return false end
+	local ok, shown = pcall(function() return gui:IsShown() end)
+	return ok and shown and true or false
+end
+local function execute_reload_choice(expected_id, n, selected)
+	local weapon = same_active_weapon(expected_id)
+	if not (weapon and n and selected) then return false end
+	local ready = readiness(weapon, expected_id)
+	if JAM_ROUTE[ready] then canonical_reload() return true end
+	if ready ~= "healthy" then return false end
+	local detachable = detachable_supported(weapon)
+	if detachable == nil then canonical_reload() return true end
+	if detachable then
+		local magazine, candidate_count = exact_selected_magazine(weapon, selected)
+		local type_ok, current = call_method(weapon, "get_ammo_type")
+		current = type_ok and tonumber(current) or nil
+		if not (magazine and current) then return false end
+		if n == current + 1 and candidate_count <= current_magazine_rounds(weapon) then return false end
+		return start_or_stage_mag_reload(weapon, magazine, selected)
+	end
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	local type_ok, current = call_method(weapon, "get_ammo_type")
+	local state = {mode = "engine", weapon_id = expected_id, selected_index = n - 1,
+		selected_section = selected, original_index = current}
+	if count_ok and count == 1 and type_ok and current ~= state.selected_index then
+		local retain = not magazines or type(magazines.retain_round) ~= "function" or
+			safe_bool(magazines.retain_round, weapon)
+		if retain then
+			state.staged_chamber = true
+			if stage_animation(state) then return true end
+			state.staged_chamber = nil
+		end
+	end
+	return start_selected_engine_reload(state)
+end
+local function wrapped_on_ammo(self, n, ...)
+	if not (wheel and self and self.id ~= nil and self.id == wheel.weapon_id) then
+		return original.on_ammo(self, n, ...) end
+	if wheel.redundant and wheel.redundant[n] then
+		local id = wheel.weapon_id
+		self:Close()
+		log_info("Reload ammo selector dismissed | weapon_id=%s | reason=redundant", tostring(id))
+		return
+	end
+	if not (n and self.ammo_list and self.ammo_list[n] and self.avail and self.avail[n]) then
+		self:Close()
+		return
+	end
+	local expected_id = wheel.weapon_id
+	local selected = self.ammo_list[n]
+	self:Close()
+	return execute_reload_choice(expected_id, n, selected)
+end
+local function wrapped_switch_next(self, ...)
+	if not (wheel and self and self.id ~= nil and self.id == wheel.weapon_id) then
+		return original.switch_next(self, ...) end
+	local weapon = same_active_weapon(wheel.weapon_id)
+	if not weapon then self:Close() return end
+	local ok, current = call_method(weapon, "get_ammo_type")
+	if not ok then self:Close() return end
+	local max, selected = tonumber(self.ammo_max) or 12, nil
+	for i = current + 2, max do if self.avail and self.avail[i] then selected = i break end end
+	if not selected then for i = 1, current do if self.avail and self.avail[i] then selected = i break end end end
+	if not selected and self.avail and self.avail[current + 1] then selected = current + 1 end
+	if selected then self:OnAmmo(selected) else self:Close() end
+end
+local function wrapped_wheel_close(self, ...)
+	if wheel and self and self.id ~= nil and self.id == wheel.weapon_id then wheel = nil end; return original.wheel_close(self, ...)
+end
+local function weapon_class(weapon)
+	local ok, section = call_method(weapon, "section")
+	if not (ok and section and ini_sys and type(ini_sys.r_string_ex) == "function") then return nil end
+	local read_ok, class = call_method(ini_sys, "r_string_ex", section, "class")
+	return read_ok and class or nil
+end
+-- Tube, cylinder or fixed box magazine at capacity; an unreadable count or
+-- size counts as full, so the loaded type stays greyed.
+local function internal_magazine_full(weapon)
+	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
+	local size_ok, size = pcall(function() return weapon:cast_Weapon():GetAmmoMagSize() end)
+	if not (count_ok and size_ok and type(count) == "number" and type(size) == "number" and size > 0) then return true end
+	return count >= size
+end
+local function open_reload_wheel(weapon)
+	local id = object_id(weapon)
+	if id == nil or not same_active_weapon(id) then return false, "weapon_changed" end
+	local ready = readiness(weapon, id)
+	if ready ~= "healthy" then return false, ready end
+	if type(IsItem) == "function" and IsItem("fake_ammo_wpn", weapon:section()) then return false, "fake_ammo_weapon" end
+	if legacy_gui_shown() then return wheel and wheel.weapon_id == id or false, "gui_busy" end
+	local pending = {weapon_id = id, redundant = {}}
+	wheel = pending
+	local ok, err = pcall(native_start_ammo_wheel)
+	if not ok or not legacy_gui_shown() then
+		if wheel == pending then wheel = nil end
+		if not ok then log_error("failed to open Reload ammo selector: %s", tostring(err)) end
+		return false, ok and "gui_not_ready" or "open_error"
+	end
+	local gui = item_weapon and item_weapon.GUI
+	if not gui or gui.id ~= id then
+		if gui and type(gui.Close) == "function" then pcall(gui.Close, gui) end
+		wheel = nil
+		return false, "gui_weapon_mismatch"
+	end
+	local detachable = detachable_supported(weapon)
+	if detachable == nil then
+		gui:Close()
+		canonical_reload()
+		return true, "support-query-failed"
+	end
+	local type_ok, ammo_type = call_method(weapon, "get_ammo_type")
+	local index = type_ok and (tonumber(ammo_type) or -1) + 1 or nil
+	local current_count = detachable and current_magazine_rounds(weapon) or 0
+	-- The loaded type stays marked by Mags' highlight either way; it is greyed
+	-- only when a pick could not add a round: a full internal magazine, or no
+	-- carried magazine of that type holding more than the inserted one.
+	local internal_full = not detachable and internal_magazine_full(weapon)
+	-- A break-action reload (CWeaponBM16::PlayAnimReload) asks for two shells
+	-- of the chosen type and switches to another carried type when there is
+	-- only one, so with the wheel open a one-shell type cannot be honoured.
+	local break_action = not detachable and weapon_class(weapon) == "WP_BM16"
+	local last, action_count, other_types = tonumber(gui.ammo_max) or 12, 0, 0
+	gui.avail = gui.avail or {}
+	for i = 1, last do
+		local section = gui.ammo_list and gui.ammo_list[i] or nil
+		local native_available = section and gui.avail[i] and true or false
+		local magazine, candidate_count
+		if detachable and section then magazine, candidate_count = exact_selected_magazine(weapon, section) end
+		local redundant = false
+		if i == index then
+			if detachable then redundant = not candidate_count or candidate_count <= current_count
+			else redundant = internal_full end
+		end
+		local single_shell = break_action and section and (tonumber(gui.ammo_inv and gui.ammo_inv[section]) or 0) < 2
+		if not native_available or detachable and not magazine or redundant or single_shell then
+			if redundant then pending.redundant[i] = true end
+			gui.avail[i] = false
+			if section and utils_xml and type(utils_xml.set_icon) == "function" and gui.box_icon and gui.box_icon_tmp then
+				pcall(utils_xml.set_icon, section, true, gui.box_icon[i], gui.box_icon_tmp[i])
+			end
+			if gui.box_num and gui.box_num[i] then call_method(gui.box_num[i], "SetText", "") end
+		else
+			action_count = action_count + 1
+			if i ~= index then other_types = other_types + 1 end
+		end
+	end
+	-- Types past the ninth sit on Mags' extended panel under the wheel.  GAMMA
+	-- converts self-made buckshot (the tenth 12-gauge type) on pickup, and its
+	-- own wheel hides that panel; show a box there only for a carried or
+	-- loaded type, and the panel only when one remains.
+	local extended_used = false
+	for i = 10, last do
+		local section = gui.ammo_list and gui.ammo_list[i] or nil
+		local carried = section and gui.ammo_inv and (tonumber(gui.ammo_inv[section]) or 0) > 0
+		if section and (carried or i == index) then
+			extended_used = true
+		elseif gui.box and gui.box[i] then
+			call_method(gui.box[i], "Show", false)
+		end
+	end
+	if not extended_used and gui.extended then call_method(gui.extended, "Show", false) end
+	-- With no other type carried, a magazine-less weapon tops up straight away.
+	if action_count == 0 or not detachable and other_types == 0 then
+		gui:Close()
+		if not detachable then canonical_reload() end
+		log_info("Reload ammo selector skipped | weapon_id=%s | reason=no_options | detachable=%s",
+			tostring(id), tostring(detachable))
+		return true, "no_options"
+	end
+	return true, "opened"
+end
+local function request_reload_wheel(weapon, dik)
+	local id = object_id(weapon)
+	if id == nil then return false end
+	local now = now_ms()
+	selector = {weapon_id = id, dik = dik, next_at = now + 1,
+		hard_deadline = now + SELECTOR_BUSY_WATCHDOG_MS, attempts = 0, last_reason = "queued"}
+	return true
+end
+local function update_reload_wheel_request()
+	local request = selector
+	if not request then return end
+	local now = now_ms()
+	if now < request.next_at then return end
+	local weapon = same_active_weapon(request.weapon_id)
+	if not weapon then selector = nil return end
+	local ready = readiness(weapon, request.weapon_id)
+	if JAM_ROUTE[ready] or ready == "grenade" or ready == "invalid" then
+		selector = nil
+		canonical_reload(request.dik)
+		return
+	end
+	local hud_free = hud_is_free()
+	if hud_free and ready == "healthy" and not animation_active() then
+		request.open_deadline = request.open_deadline or now + SELECTOR_OPEN_RETRY_MS
+		request.attempts = request.attempts + 1
+		local opened, reason = open_reload_wheel(weapon)
+		request.last_reason = reason or "opened"
+		if opened then selector = nil return end
+		if reason == "fake_ammo_weapon" then
+			selector = nil
+			canonical_reload(request.dik)
+			return
+		end
+	else
+		-- Bolt cycling, DRS, or another short HUD action must not spend the
+		-- selector's actual open-retry window. Restart that short window only
+		-- once this exact weapon is eligible again.
+		request.open_deadline = nil
+		request.last_reason = not hud_free and "hud_busy" or ready
+	end
+	if now >= request.hard_deadline or request.open_deadline and now >= request.open_deadline then
+		selector = nil
+		log_error("Reload ammo selector request expired | weapon_id=%s | attempts=%s | reason=%s",
+			tostring(request.weapon_id), tostring(request.attempts), tostring(request.last_reason))
+		return
+	end
+	request.next_at = now + 25
+end
+local function classify_long(state, weapon)
+	if state.long or state.tap_only or state.cancelled then return end
+	if force_jam_tap(state, weapon) then return end
+	state.long = true -- claim before attempting work; failure never becomes Reload.
+	local claim = aml and aml.claim_field_load
+	if type(claim) ~= "function" then return end
+	local ok, result = pcall(claim, weapon)
+	if not ok then log_error("Reload-hold AML claim failed: %s", tostring(result)) return end
+	log_info("Reload hold classified | weapon_id=%s | held_ms=%s | result=%s", tostring(state.weapon_id),
+		tostring(now_ms() - state.started_at), tostring(result))
+	if result == "pass" then
+		state.long = false
+		state.tap_only = true
+	end
+end
+local function fdda_owns_input()
+	local manager = liz_fdda_input_manager
+	return manager and manager.is_input_disabled == true or false
+end
+local function cancel_fdda_action()
+	if not fdda_owns_input() then return false end
+	local stop = lam2 and lam2.stop_all_actions
+	if type(stop) ~= "function" then return false end
+	local ok, err = pcall(stop)
+	if not ok then log_error("Reload failed to cancel active FDDA action: %s", tostring(err)) end
+	return true
+end
+local function is_reload(bind) return key_bindings and bind == key_bindings.kWPN_RELOAD end
+-- A Reload edge replay_native is sending through to the native chain.
+local function is_replay(dik, bind) return replay_depth > 0 and dik == replay_key and is_reload(bind) end
+local function hold_reached(state)
+	return now_ms() - state.started_at >= (tonumber(get_setting("hold_time", 0.45)) or 0.45) * 1000
+end
+local function wrapped_key_press(dik, bind, dis, ...)
+	if not is_reload(bind) or is_replay(dik, bind) then return original.key_press(dik, bind, dis, ...) end
+	if wheel and legacy_gui_shown() then
+		local id = wheel.weapon_id
+		local gui = item_weapon and item_weapon.GUI
+		gesture, selector = nil, nil
+		wheel_cancel_dik = dik
+		if gui and type(gui.Close) == "function" then
+			local ok, err = pcall(gui.Close, gui)
+			if not ok then log_error("failed to dismiss Reload ammo selector: %s", tostring(err)) end
+		else
+			wheel = nil
+		end
+		log_info("Reload ammo selector dismissed | weapon_id=%s | reason=reload", tostring(id))
+		return true
+	end
+	if animation_active() then return true end
+	if selector then return true end
+	if dis or not hud_is_free() then return original.key_press(dik, bind, dis, ...) end
+	local down, query_ok = safe_bool(key_state, dik)
+	if not query_ok then return original.key_press(dik, bind, dis, ...) end
+	-- The engine stores a whole input batch's key states before dispatching
+	-- it, so a tap whose press and release fall in one frame arrives here
+	-- already up, exactly like a script's level.press_action.  With a weapon in
+	-- hand or an AML load running, the press is held as an unconfirmed gesture:
+	-- the release that follows a tap in the same batch confirms it, and
+	-- on_actor_frame hands a press with no release back to the native chain.
+	-- (A script that pressed and released Reload in one call would read as a
+	-- tap; nothing in GAMMA does.)
+	if not down and ((gesture and not gesture.unconfirmed) or fdda_owns_input() or
+		not (safe_bool(aml and aml.active) or active_weapon())) then
+		return original.key_press(dik, bind, dis, ...)
+	end
+	if gesture then
+		-- on_key_press is an edge event; continuous input arrives through
+		-- on_key_hold. A second physical edge therefore supersedes a gesture
+		-- whose release callback was lost instead of inheriting its old timer.
+		local stale = gesture
+		gesture = nil
+		if stale.unconfirmed then
+			pass_through_press(stale)
+		else
+			if stale.long then aml_notify("interrupt") end
+			log_error("replaced unreleased Reload gesture | weapon_id=%s | age_ms=%s",
+				tostring(stale.weapon_id), tostring(now_ms() - stale.started_at))
+		end
+	end
+	if cancel_fdda_action() then
+		-- Native Reload is a cancel-only press while FDDA owns input.  Keep a
+		-- cancelled gesture solely to swallow hold/release (including a release
+		-- recovered by on_actor_frame); it can never classify or start work.
+		gesture = { dik = dik, started_at = now_ms(), cancelled = true, action_cancel = true }
+		return true
+	end
+	local weapon = active_weapon()
+	local loading, available = safe_bool(aml and aml.active), safe_bool(aml and aml.available)
+	if not weapon and not loading and not available then return original.key_press(dik, bind, dis, ...) end
+	local jammed = weapon and JAM_ROUTE[readiness(weapon, object_id(weapon))]
+	local detachable = weapon and detachable_supported(weapon)
+	if not weapon then detachable = false end
+	gesture = {
+		dik = dik, weapon_id = object_id(weapon), started_at = now_ms(), long = false, cancelled = loading,
+		tap_only = (not get_setting("enabled", true) or jammed or not available) and true or false,
+		force_canonical = (jammed or weapon and detachable == nil) and true or false,
+		unconfirmed = not down or nil,
+		-- A script's press must not stop an AML load: wait for the release.
+		interrupt_on_release = loading and not down or nil,
+	}
+	if loading and down then aml_notify("interrupt") end
+	return true
+end
+local function wrapped_key_hold(dik, bind, dis, ...)
+	if is_replay(dik, bind) then return original.key_hold(dik, bind, dis, ...) end
+	if wheel_cancel_dik and dik == wheel_cancel_dik then return true end
+	if is_reload(bind) and animation_active() then return true end
+	if not (gesture and dik == gesture.dik) then return original.key_hold(dik, bind, dis, ...) end
+	local weapon = gesture.weapon_id and same_active_weapon(gesture.weapon_id) or nil
+	if dis or not hud_is_free() or gesture.weapon_id and not weapon then gesture.cancelled = true return true end
+	force_jam_tap(gesture, weapon)
+	if not gesture.long and hold_reached(gesture) then classify_long(gesture, weapon) end
+	return true
+end
+local function finish_reload_gesture(state, dis)
+	local weapon = state.weapon_id and same_active_weapon(state.weapon_id) or nil
+	if dis or not hud_is_free() or state.weapon_id and not weapon then state.cancelled = true end
+	force_jam_tap(state, weapon, true)
+	if not state.long and not state.cancelled and hold_reached(state) then classify_long(state, weapon) end
+	if state.force_canonical and not state.cancelled and weapon then
+		canonical_reload(state.dik)
+	elseif not state.long and not state.cancelled and weapon then
+		local jammed = JAM_ROUTE[readiness(weapon, object_id(weapon))]
+		if jammed then
+			canonical_reload(state.dik)
+		else
+			request_reload_wheel(weapon, state.dik)
+		end
+	end
+end
+local function wrapped_key_release(dik, bind, dis, ...)
+	if is_replay(dik, bind) then return original.key_release(dik, bind, dis, ...) end
+	if wheel_cancel_dik and dik == wheel_cancel_dik then
+		wheel_cancel_dik = nil
+		-- A script's press that closed the wheel leaves no release behind, so
+		-- a same-batch tap started since then owns this release.
+		if not (gesture and gesture.unconfirmed and dik == gesture.dik) then
+			release_tombstone = {dik = dik, expires_at = now_ms() + RELEASE_TOMBSTONE_MS}
+			return true
+		end
+	end
+	if release_tombstone and dik == release_tombstone.dik then
+		if now_ms() > release_tombstone.expires_at then
+			release_tombstone = nil
+		elseif not (gesture and dik == gesture.dik) then
+			release_tombstone = nil
+			return true
+		else
+			local down, query_ok = safe_bool(key_state, dik)
+			if query_ok and down then
+				-- This is the delayed callback for the release already observed by
+				-- reconciliation; keep the newer physical gesture intact.
+				release_tombstone = nil
+				return true
+			end
+			release_tombstone = nil
+		end
+	end
+	if is_reload(bind) and animation_active() then return true end
+	if not (gesture and dik == gesture.dik) then return original.key_release(dik, bind, dis, ...) end
+	local state = gesture
+	gesture = nil
+	release_tombstone = {dik = state.dik, expires_at = now_ms() + RELEASE_TOMBSTONE_MS}
+	if state.interrupt_on_release then aml_notify("interrupt") end
+	finish_reload_gesture(state, dis)
+	return true
+end
+local function update_reload_controller()
+	if wheel and not legacy_gui_shown() then wheel = nil end
+	local state = intent
+	if not state then return end
+	if state.phase == "awaiting_eject" then
+		if now_ms() > state.deadline or not same_active_weapon(state.weapon_id) or
+			not safe_bool(magazines and magazines.action_in_progress) then intent = nil end
+		return
+	end
+	local weapon = same_active_weapon(state.weapon_id)
+	if not weapon or not hud_is_free() or safe_bool(IsMoveState, "mcSprint") or
+		readiness(weapon, state.weapon_id) ~= "healthy" then
+		cancel_intent("weapon/HUD/readiness changed")
+		return
+	end
+	local now = now_ms()
+	if state.phase == "prepare" and now >= state.next_at then
+		if game and type(game.actor_lower_weapon) == "function" then pcall(game.actor_lower_weapon, false) end
+		if axr_main and axr_main.weapon_is_zoomed and level and key_bindings and type(bind_to_dik) == "function" then
+			local ok, dik = pcall(bind_to_dik, key_bindings.kWPN_ZOOM)
+			if ok and dik ~= nil then
+				local toggle = false
+				if type(get_console) == "function" then
+					local console_ok, console = pcall(get_console)
+					if console_ok then
+						local query_ok, value = call_method(console, "get_bool", "wpn_aim_toggle")
+						if query_ok then toggle = value and true or false end
+					end
+				end
+				state.internal_zoom = true
+				if toggle then pcall(level.press_action, dik) else pcall(level.release_action, dik) end
+				state.internal_zoom = false
+			end
+		end
+		state.phase, state.next_at = "play", now + 1
+	elseif state.phase == "play" and now >= state.next_at then
+		state.phase, state.started_at, state.play_callback_pending = "wait", now, true
+		local ok, duration = call_method(weapon, "play_hud_motion", state.alias, true, 0, 1, 0)
+		state.play_callback_pending = false
+		if intent ~= state or state.phase == "commit" then return end
+		if not ok or type(duration) ~= "number" or duration <= 0 then
+			state.phase, state.commit_at = "commit", now_ms() + 50
+			log_error("animation play failed; using safe immediate path | weapon_id=%s | %s",
+				tostring(state.weapon_id), tostring(duration))
+			return
+		end
+		state.finish_at, state.deadline = state.started_at + duration, state.started_at + duration + 1000
+		play_configured_motion_sound(state, "snd_reload_misfire", "snd_reload_1")
+	elseif state.phase == "wait" then
+		if now - state.started_at > 100 and safe_bool(game and game.actor_weapon_lowered) then cancel_intent("weapon lowered")
+		elseif now >= state.finish_at or now > state.deadline then complete_animation("watchdog") end
+	elseif state.phase == "commit" then
+		if safe_bool(game and game.actor_weapon_lowered) then cancel_intent("weapon lowered before commit")
+		elseif now >= state.commit_at then
+			if intent ~= state then return end
+			if state.mode == "mag" then
+				if not start_selected_mag_reload(state) then intent = nil end
+			elseif not start_selected_engine_reload(state) and intent == state then
+				intent = nil
+			end
+		end
+	end
+end
+-- The composition root owns the one actor_on_update of the whole package: it
+-- calls core.update() and then this body.  Exported, never registered here.
+function on_actor_frame()
+	assignment_notify("on_frame_begin")
+	local now = now_ms()
+	if installed and now >= next_auto_reload_check then
+		next_auto_reload_check = now + 1000
+		enforce_manual_reload("periodic check")
+	end
+	local state = gesture
+	if state and state.unconfirmed then
+		-- A same-batch tap is released before any actor update runs, so this
+		-- press had no release: it was not the player's key.
+		gesture = nil
+		pass_through_press(state)
+		state = nil
+	end
+	if state then
+		local gesture_now = now_ms()
+		local down, query_ok = safe_bool(key_state, state.dik)
+		if query_ok and not down and gesture_now - state.started_at >= 25 then
+			gesture = nil
+			release_tombstone = {dik = state.dik, expires_at = now_ms() + RELEASE_TOMBSTONE_MS}
+			finish_reload_gesture(state, false)
+		elseif gesture_now - state.started_at > 10000 then
+			gesture = nil
+			if state.long then aml_notify("interrupt") end
+			log_error("discarded stale Reload gesture | weapon_id=%s", tostring(state.weapon_id))
+		end
+	end
+	aml_notify("on_actor_update")
+	-- Idle early return for the controller's own work: with no selector
+	-- request, staged animation or legacy wheel in flight there is nothing for
+	-- either step to advance.  The service notifications around it still run
+	-- every frame (AML watches native loads, the assignment service drains its
+	-- repack request), and so do the g_auto_reload poll above and the
+	-- weapon_motion refresh below, which withdraws the fact within a frame of
+	-- any exit that drops the prelude.
+	if selector or intent or wheel then
+		update_reload_wheel_request()
+		update_reload_controller()
+	end
+	publish_motion()
+	assignment_notify("on_actor_update")
+end
+local function actor_on_hud_animation_play(anim_table, item)
+	core_notify("on_hud_animation_play", anim_table, item)
+	local cosmetic = field_motion
+	if cosmetic and object_id(item) == cosmetic.weapon_id then
+		local name = anim_table and anim_table.anm_name or nil
+		local lower = type(name) == "string" and string.lower(name) or ""
+		local unsafe = lower == "" or lower == "$cancel" or string.find(lower, "misfire", 1, true) or
+			string.find(lower, "shoot", 1, true) or string.find(lower, "idle", 1, true) or
+			string.find(lower, "hide", 1, true) or string.find(lower, "show", 1, true)
+		if not cosmetic.motion_seen and not unsafe and
+			(cosmetic.play_callback_pending or lower == string.lower(cosmetic.alias)) then
+			cosmetic.motion_seen = true
+			cosmetic.resolved_alias = name
+		elseif cosmetic.motion_seen and lower == string.lower(cosmetic.resolved_alias or cosmetic.alias) then
+			-- Some HUD layers report the same owned animation more than once.
+		elseif cosmetic.motion_seen and string.find(lower, "idle", 1, true) then
+			cosmetic.completed = true
+		else
+			stop_state_sound(cosmetic)
+			field_motion = nil
+			cleanup_mags(false)
+			log_info("field reload motion interrupted | phase=%s | weapon_id=%s | animation=%s",
+				tostring(cosmetic.bookend), tostring(cosmetic.weapon_id), tostring(name))
+		end
+	end
+	local state = intent
+	if not (state and state.phase == "wait" and object_id(item) == state.weapon_id) then return end
+	local name = anim_table and anim_table.anm_name or nil
+	if type(name) ~= "string" then cancel_intent("unnamed HUD animation") return end
+	local lower = string.lower(name)
+	if not state.motion_seen and state.play_callback_pending and string.find(lower, "misfire", 1, true) then
+		state.motion_seen = true
+		return
+	end
+	if state.motion_seen and string.find(lower, "idle", 1, true) then
+		if safe_bool(IsMoveState, "mcSprint") or safe_bool(game and game.actor_weapon_lowered) then
+			cancel_intent("lowered/sprint idle")
+		else complete_animation("HUD returned to idle") end
+		return
+	end
+	cancel_intent("interrupted by " .. name)
+end
+local function actor_on_weapon_no_ammo()
+	if installed then enforce_manual_reload("empty weapon") end
+end
+local function on_console_execute(command)
+	if installed and type(command) == "string" and string.lower(command) == "g_auto_reload" then
+		enforce_manual_reload("console command")
+	end
+end
+local function on_before_key_press(dik, bind, dis, flags)
+	local movement = key_bindings and ((key_bindings.kJUMP and bind == key_bindings.kJUMP) or
+		(key_bindings.kSPRINT_TOGGLE and bind == key_bindings.kSPRINT_TOGGLE) or
+		(key_bindings.kACCEL and bind == key_bindings.kACCEL))
+	if movement then
+		aml_call("on_movement_input", bind)
+		-- A bookend is the visible ownership transaction.  Its initiating
+		-- jump/sprint press cancels future AML work but cannot also tear the
+		-- magazine-closing motion back down in the same frame.
+		if field_motion and flags then flags.ret_value = false end
+	end
+	if intent and intent.internal_zoom and key_bindings and bind == key_bindings.kWPN_ZOOM then return end
+	if (animation_active() or field_motion) and flags and key_bindings and
+		(bind == key_bindings.kWPN_FIRE or bind == key_bindings.kWPN_ZOOM or
+		bind == key_bindings.kWPN_RELOAD or bind == key_bindings.kWPN_FIREMODE_PREV or
+		bind == key_bindings.kWPN_FIREMODE_NEXT or bind == key_bindings.kWPN_FUNC or
+		bind == key_bindings.kCUSTOM21 or bind == key_bindings.kCUSTOM22) then flags.ret_value = false end
+end
+local function reset_state()
+	gesture, wheel, selector, release_tombstone, wheel_cancel_dik = nil, nil, nil, nil, nil
+	replay_depth, replay_key = 0, nil
+	next_auto_reload_check = 0
+	if intent and intent.phase ~= "awaiting_eject" then stop_state_sound(intent) end
+	stop_state_sound(field_motion)
+	intent, field_motion = nil, nil
+	cleanup_mags(false)
+end
+local function on_game_load()
+	core_notify("on_game_load")
+	aml_notify("on_game_load")
+	reset_state()
+	assignment_notify("on_game_load")
+	if installed then enforce_manual_reload("game load") end
+end
+-- The members install_hooks replaces as one unit (all or none), reported to
+-- the compat core's seam registry by these names.
+local CONTROLLER_HOOKS = {
+	"level_input.on_key_press", "level_input.on_key_hold", "level_input.on_key_release",
+	"magazines.eject_magazine", "magazines.timer_eject_magazine",
+	"magazines.delay_load_weapon", "magazines.load_weapon",
+	"mags_patches.UIWheelAmmoWuut.OnAmmo", "mags_patches.UIWheelAmmoWuut.SwitchNextAmmo",
+	"mags_patches.UIWheelAmmoWuut.Close",
+}
+local function missing_controller_api()
+	return core.missing_member(level_input, "level_input", { "on_key_press", "on_key_hold", "on_key_release" }) or
+		core.missing_member(magazines, "magazines", { "eject_magazine", "timer_eject_magazine",
+			"delay_load_weapon", "load_weapon", "actor_on_weapon_reload" }) or
+		(native_start_ammo_wheel == nil and "item_weapon.start_ammo_wheel") or
+		core.missing_member(mags_patches and mags_patches.UIWheelAmmoWuut, "mags_patches.UIWheelAmmoWuut",
+			{ "OnAmmo", "SwitchNextAmmo", "Close" }) or nil
+end
+local function record_controller_hooks(missing)
+	for i = 1, #CONTROLLER_HOOKS do core.record_seam(CONTROLLER_HOOKS[i], missing) end
+end
+local function install_hooks()
+	if installed then return true end
+	local missing = missing_controller_api()
+	if missing then
+		record_controller_hooks(missing)
+		return false
+	end
+	local cls = mags_patches.UIWheelAmmoWuut
+	original.key_press, original.key_hold, original.key_release =
+		level_input.on_key_press, level_input.on_key_hold, level_input.on_key_release
+	original.eject_magazine, original.timer_eject_magazine = magazines.eject_magazine, magazines.timer_eject_magazine
+	original.delay_load_weapon, original.load_weapon = magazines.delay_load_weapon, magazines.load_weapon
+	original.on_ammo, original.switch_next, original.wheel_close = cls.OnAmmo, cls.SwitchNextAmmo, cls.Close
+	level_input.on_key_press, level_input.on_key_hold, level_input.on_key_release =
+		wrapped_key_press, wrapped_key_hold, wrapped_key_release
+	magazines.eject_magazine, magazines.timer_eject_magazine = wrapped_eject_magazine, wrapped_timer_eject_magazine
+	magazines.delay_load_weapon, magazines.load_weapon = wrapped_delay_load_weapon, wrapped_load_weapon
+	cls.OnAmmo, cls.SwitchNextAmmo, cls.Close = wrapped_on_ammo, wrapped_switch_next, wrapped_wheel_close
+	record_controller_hooks(nil)
+	local eject_missing = core.missing_member(mags_patches, "mags_patches", { "eject" })
+	core.record_seam("mags_patches.eject", eject_missing)
+	if not eject_missing then mags_patches.eject = wrapped_eject_magazine end
+	local current = _G.CHudItem__OnMotionMark
+	core.record_seam("_G.CHudItem__OnMotionMark", type(current) ~= "function" and "_G.CHudItem__OnMotionMark" or nil)
+	if type(current) == "function" then
+		motion_mark_original = current
+		motion_mark_wrapper = function(state, mark, item, owner, ...)
+			local pending = intent
+			if pending and pending.phase == "wait" then
+				local id = object_id(item)
+				if id == pending.weapon_id or id == nil and same_active_weapon(pending.weapon_id) then return end
+			end
+			local cosmetic = field_motion
+			if cosmetic and not cosmetic.completed then
+				local id = object_id(item)
+				if id == cosmetic.weapon_id or id == nil and same_active_weapon(cosmetic.weapon_id) then return end
+			end
+			return motion_mark_original(state, mark, item, owner, ...)
+		end
+		_G.CHudItem__OnMotionMark = motion_mark_wrapper
+	end
+	installed = true
+	return true
+end
+-- axr_main calls every registered callback unprotected, so one that raised
+-- would cut the rest of that event's chain short for every other mod (a
+-- failing save_state would skip their saves).  Each controller callback is
+-- registered through this wrapper; the first failure of each is logged.
+local callback_failed = {}
+local function guarded_callback(name, fn)
+	return function(...)
+		local ok, err = pcall(fn, ...)
+		if not ok and not callback_failed[name] then
+			callback_failed[name] = true
+			log_error("callback %s failed: %s", name, tostring(err))
+		end
+	end
+end
+local function register_guarded(name, fn) RegisterScriptCallback(name, guarded_callback(name, fn)) end
+function on_game_start()
+	install_drs_motion_guard()
+	if not callbacks_registered then
+		register_guarded("actor_on_weapon_reload", actor_on_weapon_reload)
+		register_guarded("actor_on_weapon_no_ammo", actor_on_weapon_no_ammo)
+		register_guarded("actor_on_hud_animation_play", actor_on_hud_animation_play)
+		register_guarded("actor_on_hud_animation_end", actor_on_hud_animation_end)
+		register_guarded("on_before_key_press", on_before_key_press)
+		register_guarded("on_console_execute", on_console_execute)
+		register_guarded("on_game_load", on_game_load)
+		register_guarded("save_state", on_save_state)
+		register_guarded("load_state", on_load_state)
+		register_guarded("actor_on_net_destroy", reset_state)
+		register_guarded("actor_on_before_death", reset_state)
+		register_guarded("on_level_changing", reset_state)
+		callbacks_registered = true
+	end
+	local ready = installed or install_hooks()
+	-- Every subsystem script has reported its hooks by now: the compat core,
+	-- assignment service and AML bridge install at load and in their own
+	-- on_game_start, which axr_main runs before this one (filename order).
+	core.report_seam_mismatch()
+	if not ready then
+		if not inactive_logged then
+			inactive_logged = true
+			log_error("inactive | build=%s | missing Reload/Mags/ammo-wheel API", BUILD)
+		end
+		return
+	end
+	enforce_manual_reload("game start")
+	if marker_logged then return end
+	marker_logged = true
+	local caps = type(core.capabilities) == "function" and core.capabilities() or {}
+	local aml_mode, aml_reason = "absent", nil
+	if aml and type(aml.status) == "function" then
+		local ok, mode, reason = pcall(aml.status)
+		if ok then aml_mode, aml_reason = tostring(mode), reason end
+	end
+	log_info("installed | build=%s | wpo=%s | clone=%s | aml=%s | drs=%s | motion_marks=%s | auto_reload=%s | reload=release-selector/hold-field-batch%s",
+		BUILD, caps.wpo or "absent", tostring(caps.clone), aml_mode,
+		caps.drs or "absent", motion_mark_wrapper and "suppressed" or "unavailable", auto_reload_status,
+		aml_reason and " | aml_reason=" .. tostring(aml_reason) or "")
+end
+install_hooks()

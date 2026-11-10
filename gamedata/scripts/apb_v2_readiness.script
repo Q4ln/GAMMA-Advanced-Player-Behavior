@@ -1,0 +1,471 @@
+-- Advanced Player Behavior v2: adaptive low-ready controller.
+-- Aim and Fire are observed only; their native streams are never claimed.
+-- Their hardware state is read from the core's shared action-down registry
+-- (fed by the observe funnel); the observer below keeps only the grace,
+-- reconcile and wake side effects of an edge.
+-- Readiness is deliberately not persistent: nothing is saved, and every load
+-- starts from a fresh scan. Readiness owns no Reload posture: the vendored
+-- Mags controller owns it entirely, and readiness has no magazine seam; it
+-- reads only the generic weapon_motion fact (see sources).
+
+local api = apb_v2_core
+local player = apb_v2_player_adapter
+local ID = "readiness"
+local MOTION_FLAG = "weapon_motion"
+
+local UNOWNED = "UNOWNED"
+local PEACE_LOW = "PEACE_LOW"
+local READY_ACTIVE = "READY_ACTIVE"
+local READY_GRACE = "READY_GRACE"
+local EVENT_MS = 250
+local MUTANT_STALE_MS = 1000
+local MUTANT_CHECK_MS = 100
+local MUTANT_IDLE_CHECK_MS = 500
+
+local enabled = false
+local mode = UNOWNED
+local mode_reason = nil
+-- The last mode written to the log (nil after a reset or a weapon change).
+-- A suspension (see RELEASED) is not logged, and neither is the return to the
+-- mode that was last logged, so a reload, a sprint or an open inventory costs
+-- no log line, while a new weapon's first mode always gets one.
+local logged_mode = nil
+local first_scan = true
+local weapon_id = nil
+local weapon_slot = nil
+local equip_pending = false
+local initial_pending = false
+local supported_active = false
+local last_lowered = nil
+local grace_until = 0
+local hostile_until = 0
+local shot_until = 0
+local previous_active = false
+local reconcile = true
+local in_transition = false
+local safemode_claims = {}
+local mutants = {}
+
+
+local function wake() api.wake(ID, 0) end
+
+
+-- The one UNOWNED reason that ends ownership: no supported weapon in hand.
+-- Every other UNOWNED reason (weapon-busy, sprint, and each blocked
+-- presentation context) only suspends readiness until it resumes.
+local RELEASED = "unsupported-or-empty"
+
+
+local function set_mode(value, reason)
+	if mode == value then return end
+	mode = value
+	mode_reason = reason or "update"
+	if value == UNOWNED and mode_reason ~= RELEASED then return end
+	if value == logged_mode then return end
+	logged_mode = value
+	api.log_info("READY", "state=%s | reason=%s", tostring(value), tostring(mode_reason))
+end
+
+
+local function mutant_combat(current)
+	local active = false
+	for id, state in pairs(mutants) do
+		if current - state.last_check > MUTANT_STALE_MS then
+			mutants[id] = nil
+		elseif state.threat and current - state.seen_at <= MUTANT_STALE_MS then
+			active = true
+		end
+	end
+	return active
+end
+
+
+-- The zoom source (including axr_main.weapon_is_zoomed) is folded into
+-- snapshot.zoomed by the player adapter.  A published weapon_motion is a
+-- scripted HUD motion that holds the weapon at state 0, which neither the
+-- weapon state nor presentation_blocked reports; it counts like Aim.
+local function sources(current, snapshot)
+	local human = next(xr_combat_ignore.fighting_with_actor_npcs) ~= nil
+	local mutant = mutant_combat(current)
+	local threat = human or mutant or current < hostile_until
+	local active = threat or current < shot_until or api.bind_down(key_bindings.kWPN_FIRE) or
+		api.bind_down(key_bindings.kWPN_ZOOM) or api.flag(MOTION_FLAG) or
+		((snapshot and snapshot.zoomed) and true or false)
+	return active, threat
+end
+
+
+local function begin_grace(current, reason)
+	local delay = api.get_setting("v2_weapon_readiness/calm_delay_ms")
+	grace_until = current + delay
+	set_mode(delay > 0 and READY_GRACE or PEACE_LOW, reason)
+	reconcile = true
+end
+
+
+local function set_posture(lowered)
+	player.sync_lws(lowered)
+	local actual = player.weapon_lowered()
+	if actual == nil then return false end
+	last_lowered = actual
+	if actual == lowered then return true end
+	in_transition = true
+	local _, ok = api.safe_call(game and game.actor_lower_weapon, lowered and true or false)
+	in_transition = false
+	if not ok then return false end
+	actual = player.weapon_lowered()
+	last_lowered = actual
+	return actual == lowered
+end
+
+
+function reset()
+	mode = UNOWNED
+	mode_reason = nil
+	logged_mode = nil
+	first_scan = true
+	weapon_id = nil
+	weapon_slot = nil
+	equip_pending = false
+	initial_pending = false
+	supported_active = false
+	last_lowered = nil
+	grace_until = 0
+	hostile_until = 0
+	shot_until = 0
+	previous_active = false
+	reconcile = true
+	safemode_claims = {}
+	mutants = {}
+end
+
+
+local function observe_weapon(snapshot)
+	if not (first_scan or snapshot.id ~= weapon_id or snapshot.slot ~= weapon_slot) then return end
+	local was_first = first_scan
+	first_scan = false
+	weapon_id = snapshot.id
+	weapon_slot = snapshot.slot
+	logged_mode = nil
+	-- The threat cache is never wiped on an ownership change. Monster callbacks
+	-- keep tracking while nothing is owned (at the coarser idle cadence), so a
+	-- record that survived the one-second stale window is fresh and truthful,
+	-- and a weapon drawn in combat (a quick-melee round trip included) stays
+	-- raised.
+	supported_active = snapshot.supported and true or false
+	equip_pending = not was_first and snapshot.supported or false
+	initial_pending = was_first and snapshot.supported or false
+	last_lowered = player.weapon_lowered()
+	grace_until = 0
+	previous_active = false
+	reconcile = true
+end
+
+
+local function observe_external_posture(active, current)
+	local actual = player.weapon_lowered()
+	if actual == nil then return nil end
+	if last_lowered ~= nil and actual ~= last_lowered and not in_transition then
+		if not actual and not active and not equip_pending then
+			begin_grace(current, "external-raise")
+		elseif actual and active then
+			reconcile = true
+		elseif actual then
+			grace_until = 0
+		end
+	end
+	last_lowered = actual
+	return actual
+end
+
+
+function init(core)
+	api = core or apb_v2_core
+	api.track_bind(key_bindings.kWPN_FIRE)
+	api.track_bind(key_bindings.kWPN_ZOOM)
+end
+
+
+function on_option_change()
+	local wanted = api.get_setting("v2_weapon_readiness/enabled")
+	api.set_active(ID, wanted)
+	if wanted == enabled then return end
+	if not wanted then
+		local actual = player.weapon_lowered()
+		if actual ~= nil then player.sync_lws(actual) end
+		api.sleep(ID)
+	end
+	enabled = wanted
+	reset()
+end
+
+
+-- Aim/Fire edges (the declared observe binds). The core registry already
+-- holds the hardware-verified down state; a confirmed press or hold cancels
+-- the grace and a release schedules the reconcile through the ordinary path.
+function observe_input(input_phase, dik, bind, dis, ...)
+	if not enabled or dis then return end
+	if input_phase == "release" then
+		reconcile = true
+		wake()
+	elseif api.bind_down(bind) then
+		grace_until = 0
+		reconcile = true
+		wake()
+	end
+	-- Observation never claims, delays, or replays Aim/Fire.
+end
+
+
+-- Safemode, the one claimed bind, is taken only while a threat exists and no
+-- menu is open: a menu's text box must still receive that letter.
+local function claims()
+	local snapshot = player.active_weapon()
+	local _, threat = sources(api.now_ms(), snapshot)
+	return snapshot.supported and threat and player.hud_free()
+end
+
+
+-- The press path, shared by a press read down and a deferred press run at its
+-- release.
+local function press(dik)
+	if claims() then
+		safemode_claims[dik] = true
+		reconcile = true
+		wake()
+		return true
+	end
+	wake()
+	return false
+end
+
+
+-- A press read as up is a tap whose release shares its input batch, or a
+-- script's press; one the module would take waits for that release
+-- (apb_v2_core.defer_press).
+function on_key_press(dik, bind, dis)
+	if not enabled or dis then return false end
+	if api.confirmed_down(dik) then return press(dik) end
+	return claims() and api.defer_press(ID, dik, bind) or false
+end
+
+
+function on_key_hold(dik, bind, dis)
+	return safemode_claims[dik] and true or false
+end
+
+
+function on_key_release(dik, bind, dis)
+	-- A deferred press runs now and ends below as a tap; one the module no
+	-- longer takes reaches the native chain ahead of its release.
+	if api.take_deferred_press(ID, dik) and not press(dik) then
+		api.synthetic_action("press", dik, bind, false)
+		return false
+	end
+	if safemode_claims[dik] then
+		safemode_claims[dik] = nil
+		return true
+	end
+	return false
+end
+
+
+function on_update(current)
+	if not enabled then return nil end
+	if not player.actor(true) then
+		reset()
+		return 250
+	end
+	local snapshot = player.active_weapon()
+	api.prune_unconfirmed_down(safemode_claims)
+	observe_weapon(snapshot)
+	if not snapshot.supported then
+		player.sync_lws(false)
+		previous_active = false
+		set_mode(UNOWNED, RELEASED)
+		return nil
+	end
+	local active = sources(current, snapshot)
+	local actual = observe_external_posture(active, current)
+	if initial_pending and actual ~= nil and snapshot.state == 0 then
+		initial_pending = false
+		if actual == false and not active then begin_grace(current, "initial-raised") end
+	end
+	if active then
+		grace_until = 0
+	elseif previous_active then
+		begin_grace(current, "readiness-cleared")
+	end
+	previous_active = active
+
+	local wanted_low, wanted_mode, wanted_reason
+	if active then
+		wanted_low = false
+		wanted_mode, wanted_reason = READY_ACTIVE, "source-active"
+	elseif current < grace_until then
+		wanted_low = false
+		wanted_mode, wanted_reason = READY_GRACE, "calm-delay"
+	else
+		wanted_low = true
+		wanted_mode, wanted_reason = PEACE_LOW, equip_pending and "equip-idle" or "peace"
+	end
+	player.sync_lws(wanted_low)
+
+	local blocked, reason = player.presentation_blocked(snapshot, false)
+	if blocked then
+		set_mode(UNOWNED, reason)
+		reconcile = true
+		if snapshot.state ~= nil and snapshot.state ~= 0 then return 0 end
+		return 100
+	end
+	if snapshot.state ~= 0 then
+		set_mode(UNOWNED, "weapon-busy")
+		reconcile = true
+		return 0
+	end
+	set_mode(wanted_mode, wanted_reason)
+	if actual ~= wanted_low or reconcile then
+		reconcile = not set_posture(wanted_low)
+		if reconcile then
+			actual = player.weapon_lowered()
+		else
+			actual = wanted_low
+		end
+	end
+	if equip_pending and actual == wanted_low then equip_pending = false end
+	if reconcile then return 0 end
+	if not active and current < grace_until then return math.max(1, math.min(100, grace_until - current)) end
+	return 100
+end
+
+
+-- One monster_on_update: returns whether that monster's threat verdict changed.
+-- The engine hands the callback a live monster game object, so its id is read
+-- directly: this runs for every monster on every one of its updates, and the
+-- adapter's guarded read would add two pcalls to each call before the
+-- throttle below can skip it.
+local function sample_monster(monster)
+	local id = monster and monster:id()
+	if not id then return false end
+	local current = api.now_ms()
+	local state = mutants[id]
+	-- Per-object throttle first: a tracked monster that is not due costs one
+	-- table lookup and a clock read here (plus the core's protected dispatch),
+	-- an untracked one gets its record only when it is actually processed (and
+	-- a dead reference never gets one).  The interval is 100 ms while a
+	-- supported weapon is active and 500 ms while nothing is owned: tracking
+	-- never stops, it is only sampled more cheaply, so the knowledge is already
+	-- there the moment a weapon is drawn (in combat a newly selected weapon
+	-- stays raised).
+	if state ~= nil and current < state.next_check then return false end
+	local was_threat = state ~= nil and state.threat or false
+	if not player.object_alive(monster) then
+		mutants[id] = nil
+		return was_threat
+	end
+	if state == nil then
+		state = { next_check = 0, last_check = 0, seen_at = 0, threat = false }
+		mutants[id] = state
+	end
+	state.next_check = current + (supported_active and MUTANT_CHECK_MS or MUTANT_IDLE_CHECK_MS)
+	state.last_check = current
+	local enemy = api.safe_method(monster, "get_enemy")
+	state.threat = enemy and player.object_id(enemy) == AC_ID or false
+	if state.threat then state.seen_at = current end
+	return state.threat ~= was_threat
+end
+
+
+-- Fixed positional arguments (no vararg table): the consumers read the
+-- first (monster / hit target), second (hit amount) and fourth (hit attacker)
+-- callback arguments only. The clock is read inside the branches that need it.
+function on_event(name, a1, a2, a3, a4)
+	if not enabled then return end
+	local dirty = true
+	local monster_event = false
+	-- Generic HUD motions and the slot, item, zoom, reload, jam, movement and
+	-- vehicle events are declared wake-only in the descriptor. The player
+	-- adapter and weapon state identify actual presentation locks without a
+	-- callback latch that can stick.
+	if name == "monster_on_update" then
+		monster_event = true
+		dirty = sample_monster(a1)
+	elseif name == "monster_on_net_destroy" or name == "monster_on_death_callback" then
+		monster_event = true
+		local id = player.object_id(a1)
+		local state = mutants[id]
+		dirty = state and state.threat or false
+		if id then mutants[id] = nil end
+	elseif name == "actor_on_hit_callback" then
+		local amount = tonumber(a2) or 0
+		if amount > 0 and player.hostile_living(a4) then
+			hostile_until = math.max(hostile_until, api.now_ms() + EVENT_MS)
+		end
+	elseif name == "actor_on_weapon_fired" then
+		shot_until = math.max(shot_until, api.now_ms() + EVENT_MS)
+	elseif name == "actor_on_weapon_lower" then
+		last_lowered = true
+		if not in_transition then
+			local active = sources(api.now_ms(), player.active_weapon())
+			if not active then grace_until = 0 end
+			reconcile = active
+		end
+	elseif name == "actor_on_weapon_raise" then
+		last_lowered = false
+		if not in_transition then
+			local current = api.now_ms()
+			local snapshot = player.active_weapon()
+			local active = sources(current, snapshot)
+			if snapshot.supported and not active and not equip_pending and snapshot.state == 0 then
+				begin_grace(current, "external-raise-callback")
+			else
+				reconcile = true
+			end
+		end
+	elseif name == "load_complete" or name == "actor_on_first_update" then
+		-- Owns the post-load reset and wake; the four engine teardown events
+		-- reach reset() through the descriptor's resets route instead.
+		reset()
+	end
+	-- A threat change wakes the settled scheduler only while a supported
+	-- weapon is active: with nothing owned there is no posture to reconcile,
+	-- and the refreshed record is simply kept for the moment one is drawn.
+	-- Every non-monster event always wakes.
+	if dirty and (supported_active or not monster_event) then wake() end
+end
+
+
+-- The current mode, and the reason it was entered.  Nothing in the mod calls
+-- these; they are read-only views of the module's state for outside checks,
+-- including the suspensions that set_mode deliberately leaves out of the log.
+function current_mode()
+	return mode
+end
+
+
+function current_reason()
+	return mode_reason
+end
+
+
+MODULE = {
+	id = ID,
+	priority = 700,
+	events = {
+		"actor_on_first_update", "actor_on_hit_callback", "actor_on_weapon_fired",
+		"actor_on_weapon_lower", "actor_on_weapon_raise",
+		"monster_on_update", "monster_on_net_destroy", "monster_on_death_callback", "load_complete",
+	},
+	resets = { "actor_on_before_death", "actor_on_net_destroy", "on_before_level_changing", "on_level_changing" },
+	wake_only = {
+		"actor_on_hud_animation_play", "actor_on_hud_animation_end", "actor_on_weapon_reload",
+		"actor_on_weapon_jammed", "actor_on_weapon_zoom_in", "actor_on_weapon_zoom_out",
+		"actor_item_to_slot", "actor_item_to_ruck", "actor_on_changed_slot", "actor_on_movement_changed",
+		"actor_on_attach_vehicle", "actor_on_detach_vehicle",
+	},
+	input = { observe = { "kWPN_FIRE", "kWPN_ZOOM" }, claim = { "kSAFEMODE" } },
+	handlers = {
+		init = init, option_change = on_option_change, update = on_update, event = on_event, reset = reset,
+		key_press = on_key_press, key_hold = on_key_hold, key_release = on_key_release, observe = observe_input,
+	},
+}

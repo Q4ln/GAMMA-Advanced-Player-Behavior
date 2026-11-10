@@ -1,0 +1,395 @@
+-- Advanced Player Behavior v2: Suit Setups equipment queries and belt policy.
+--
+-- Statuses for every slot are evaluated from one actor snapshot. This avoids
+-- repeating belt scans and exact-reference lookups for every UI row. The
+-- snapshot passed to evaluate_status and the slot table passed to
+-- get_slots_view are mandatory; callers are internal to the suit subsystem.
+--
+-- This module owns every reference primitive and binds no other APB script:
+-- the registry arrives as the `model` parameter of get_slots_view.
+
+local duplicate_categories = {
+	["af_kevlar"] = "plate",
+	["af_plates"] = "plate",
+	["af_kevlar_up"] = "plate",
+	["af_plates_up"] = "plate",
+	["af_camelbak"] = "camel",
+	["af_camelbak_up"] = "camel",
+	["af_grid"] = "grid",
+	["af_grid_up"] = "grid",
+	["af_frames"] = "frame",
+	["af_frames_up"] = "frame",
+	["af_surge"] = "surge",
+	["af_surge_up"] = "surge",
+	["af_cooler"] = "cooler",
+	["af_cooler_up"] = "cooler",
+	["af_freon"] = "freon",
+	["af_freon_up"] = "freon",
+	["hide_pseudogiant"] = "pelt",
+	["hide_chimera"] = "pelt",
+	["hide_controller"] = "pelt",
+	["hide_burer"] = "pelt",
+	["hide_lurker"] = "pelt",
+	["hide_psysucker"] = "pelt",
+	["hide_bloodsucker"] = "pelt",
+	["hide_psy_dog"] = "pelt",
+	["hide_pseudodog"] = "pelt",
+	["hide_boar"] = "pelt",
+	["hide_flesh"] = "pelt",
+}
+
+function make_ref(obj)
+	if not obj then
+		return nil
+	end
+
+	return {
+		object_id = obj:id(),
+		section = obj:section(),
+	}
+end
+
+function same_ref(a, b)
+	if not a or not b then
+		return a == nil and b == nil
+	end
+	return a.object_id == b.object_id and a.section == b.section
+end
+
+function ref_key(ref)
+	return tostring(ref.object_id) .. "\31" .. ref.section
+end
+
+function object_matches_ref(obj, ref)
+	return obj and ref and obj:id() == ref.object_id and obj:section() == ref.section
+end
+
+function actor_owns(obj, actor)
+	actor = actor or (db and db.actor)
+	if not (obj and actor) then
+		return false
+	end
+
+	local parent = obj:parent()
+	return parent and parent:id() == actor:id()
+end
+
+local function owned_slot_item(actor, slot, predicate)
+	local obj = actor and actor:item_in_slot(slot) or nil
+	if not actor_owns(obj, actor) or (predicate and not predicate(obj)) then
+		return nil
+	end
+	return obj
+end
+
+function resolve_ref(ref, predicate, actor)
+	actor = actor or (db and db.actor)
+	if not (actor and ref) then
+		return nil
+	end
+
+	local obj = level.object_by_id(ref.object_id)
+	if not obj or not object_matches_ref(obj, ref) or not actor_owns(obj, actor) then
+		return nil
+	end
+
+	if predicate and not predicate(obj) then
+		return nil
+	end
+
+	return obj
+end
+
+function resolve_belt_ref(ref, actor)
+	return resolve_ref(ref, IsArtefact, actor)
+end
+
+function capture_belt(actor)
+	local result = {}
+	actor = actor or (db and db.actor)
+	if not actor then
+		return result
+	end
+
+	local count = actor:belt_count()
+	for index = 0, count - 1 do
+		local obj = actor:item_on_belt(index)
+		if actor_owns(obj, actor) then
+			result[#result + 1] = make_ref(obj)
+		end
+	end
+
+	return result
+end
+
+function capture_current_equipment(actor)
+	actor = actor or (db and db.actor)
+	if not actor then
+		return {suit = nil, helmet = nil, belt = {}}
+	end
+
+	return {
+		suit = make_ref(owned_slot_item(actor, 7)),
+		helmet = make_ref(owned_slot_item(actor, 12)),
+		belt = capture_belt(actor),
+	}
+end
+
+-- Returns raw equipment references. Name sanitation and registry mutation stay
+-- in apb_v2_suit_model.
+function capture_setup(actor)
+	actor = actor or (db and db.actor)
+	local suit = owned_slot_item(actor, 7, IsOutfit)
+	if not suit then
+		return nil, "no_suit"
+	end
+
+	return {
+		suit = make_ref(suit),
+		helmet = make_ref(owned_slot_item(actor, 12, IsHeadgear)),
+		belt = capture_belt(actor),
+	}
+end
+
+function outfit_capacity(outfit)
+	if not outfit then
+		return 0
+	end
+
+	local ok, capacity = pcall(function()
+		return outfit:cast_CustomOutfit():get_artefact_count()
+	end)
+	return ok and tonumber(capacity) or 0
+end
+
+-- A container counts as its artefact: the first suffix found is stripped.
+local CONTAINER_SUFFIXES = {"_lead_box", "_af_iam", "_af_aac", "_af_aam"}
+
+-- Raw section -> normalised section, or false for junk.  system.ltx does not
+-- change within a session (contract 3.4), so each section's kind is read once.
+local normalized_sections = {}
+
+-- A belt holds one item per normalised section and per duplicate category;
+-- junk has no identity and never conflicts.
+local function belt_identity(ref)
+	local section = normalized_sections[ref.section]
+	if section == nil then
+		section = ref.section
+		local kind = SYS_GetParam(0, section, "kind", "")
+		if kind == "i_arty_junk" then
+			section = false
+		elseif kind == "i_arty_cont" then
+			for _, suffix in ipairs(CONTAINER_SUFFIXES) do
+				if string.find(section, suffix, 1, true) then
+					section = string.gsub(section, suffix, "")
+					break
+				end
+			end
+		end
+		normalized_sections[ref.section] = section
+	end
+	if not section then
+		return nil
+	end
+	return section, duplicate_categories[section]
+end
+
+local function record(layout, ref)
+	local section, category = belt_identity(ref)
+	if section then
+		layout.sections[section] = true
+		if category then
+			layout.categories[category] = true
+		end
+	end
+end
+
+function belt_candidate_compatible(layout, ref)
+	local section, category = belt_identity(ref)
+	return not (section and (layout.sections[section] or category and layout.categories[category]))
+end
+
+local function belt_layout_compatible(setup, outfit)
+	if #setup.belt > outfit_capacity(outfit) then
+		return false
+	end
+
+	local layout = {sections = {}, categories = {}}
+	for _, ref in ipairs(setup.belt) do
+		if not belt_candidate_compatible(layout, ref) then
+			return false
+		end
+		record(layout, ref)
+	end
+	return true
+end
+
+function current_belt_layout()
+	local layout = {sections = {}, categories = {}}
+	for _, ref in ipairs(capture_belt()) do
+		record(layout, ref)
+	end
+	return layout
+end
+
+function belt_matches(saved, snapshot)
+	local current = snapshot and snapshot.belt or capture_belt()
+	if #current ~= #saved then
+		return false
+	end
+
+	local wanted = {}
+	for _, ref in ipairs(saved) do
+		wanted[ref_key(ref)] = true
+	end
+
+	for _, ref in ipairs(current) do
+		if not wanted[ref_key(ref)] then
+			return false
+		end
+	end
+
+	return true
+end
+
+local function collect_ref(wanted, ref)
+	if ref then
+		wanted[ref_key(ref)] = ref
+	end
+end
+
+-- Captures worn slots and belt once, then resolves each distinct saved object
+-- reference once. The resulting table is immutable by convention and valid
+-- only for the status/view pass that requested it.
+function capture_actor_snapshot(slot_setups)
+	local actor = db and db.actor or nil
+	local snapshot = {
+		actor = actor,
+		suit = nil,
+		helmet = nil,
+		belt = {},
+		carried = {},
+		can_capture = false,
+	}
+	if not actor then
+		return snapshot
+	end
+
+	snapshot.suit = actor:item_in_slot(7)
+	snapshot.helmet = actor:item_in_slot(12)
+	snapshot.belt = capture_belt(actor)
+	snapshot.can_capture = snapshot.suit
+		and actor_owns(snapshot.suit, actor)
+		and IsOutfit(snapshot.suit)
+		or false
+
+	local wanted = {}
+	for _, setup in pairs(type(slot_setups) == "table" and slot_setups or {}) do
+		collect_ref(wanted, setup.suit)
+		collect_ref(wanted, setup.helmet)
+		for _, ref in ipairs(setup.belt) do
+			collect_ref(wanted, ref)
+		end
+	end
+
+	for key, ref in pairs(wanted) do
+		snapshot.carried[key] = resolve_ref(ref, nil, actor)
+	end
+
+	return snapshot
+end
+
+local function resolve_snapshot_ref(snapshot, ref, predicate)
+	local obj = snapshot.carried[ref_key(ref)]
+	if not obj or (predicate and not predicate(obj)) then
+		return nil
+	end
+	return obj
+end
+
+local function setup_is_equipped(setup, snapshot)
+	if not snapshot.actor or not object_matches_ref(snapshot.suit, setup.suit) then
+		return false
+	end
+	if setup.helmet and not object_matches_ref(snapshot.helmet, setup.helmet) then
+		return false
+	end
+	return belt_matches(setup.belt, snapshot)
+end
+
+function evaluate_status(setup, snapshot, statuses)
+	if not setup then
+		return statuses.STATUS_EMPTY
+	end
+
+	local suit = resolve_snapshot_ref(snapshot, setup.suit, IsOutfit)
+	if not suit then
+		return statuses.STATUS_UNAVAILABLE
+	end
+
+	if setup.helmet and not resolve_snapshot_ref(snapshot, setup.helmet, IsHeadgear) then
+		return statuses.STATUS_PARTIAL
+	end
+
+	for _, ref in ipairs(setup.belt) do
+		if not resolve_snapshot_ref(snapshot, ref, IsArtefact) then
+			return statuses.STATUS_PARTIAL
+		end
+	end
+
+	if not belt_layout_compatible(setup, suit) then
+		return statuses.STATUS_PARTIAL
+	end
+
+	if setup_is_equipped(setup, snapshot) then
+		return statuses.STATUS_EQUIPPED
+	end
+
+	return statuses.STATUS_READY
+end
+
+local function evaluate_statuses(slot_setups, statuses)
+	local snapshot = capture_actor_snapshot(slot_setups)
+	local result = {}
+	for index = 1, statuses.SLOT_COUNT do
+		result[index] = evaluate_status(slot_setups[index], snapshot, statuses)
+	end
+	return result, snapshot
+end
+
+-- Builds the detached, read-only-by-ownership snapshot consumed by both UIs.
+-- Mutating this result cannot mutate the setup registry.
+--
+-- suit_object/suit_section are the row's icon: the exact saved suit object when
+-- the actor carries it (the snapshot's own ownership test, so status and icon
+-- can never disagree), else nil plus the saved section so the cell can still
+-- show the suit's icon dimmed.
+function get_slots_view(slot_setups, busy, model)
+	local statuses, snapshot = evaluate_statuses(slot_setups, model)
+	local view = {
+		busy = busy == true,
+		can_capture = snapshot.can_capture == true,
+		slots = {},
+	}
+
+	for index = 1, model.SLOT_COUNT do
+		local setup = slot_setups[index]
+		local occupied = setup ~= nil
+		local status = statuses[index]
+		local actionable = model.is_actionable(status)
+		view.slots[index] = {
+			occupied = occupied,
+			name = occupied and setup.name or tostring(index),
+			status = status,
+			suit_section = occupied and setup.suit.section or nil,
+			suit_object = occupied and snapshot.carried[ref_key(setup.suit)] or nil,
+			can_apply = not view.busy and occupied and actionable,
+			can_save = not view.busy and not occupied and view.can_capture,
+			can_overwrite = not view.busy and occupied and view.can_capture,
+			can_rename = not view.busy and occupied,
+			can_delete = not view.busy and occupied,
+		}
+	end
+
+	return view
+end

@@ -1,0 +1,1315 @@
+-- AML Contract-1 host and field-loading service of Advanced Player Behavior's
+-- magazine subsystem.  "Contract 1" is Animated Magazine Loading's own
+-- interface version (magazines_aml.CONTRACT == 1, magazines.SEAM_CONTRACT).
+-- AML owns animation and speed; this supplies the Contract 1 seams on a Mags
+-- that does not declare them itself, and atomic field loading.  Fixed
+-- filename; see zzz_mags_compat_core.
+local CONTRACT = 1
+local CANCEL_SETTLE_TIMEOUT_MS = 3000
+local EJECT_WAIT_TIMEOUT_MS = 5000
+local BOOKEND_ACTIVATE_TIMEOUT_MS = 5000
+local host_mode = "inactive" -- inactive | native | legacy
+local inactive_reason = nil
+local driver_claim, driver_interrupt, driver_active = nil, nil, nil
+local mags_action, native_is_loading = nil, nil
+local native_has_begin, native_has_drag = false, false
+local assignment = nil
+local original = {}
+local host_in_flight
+local native_lock = nil
+local native_active_query_failed = false
+local active_query_errors, cancel_latched, movement_interrupt_sent = {}, false, false
+local core = zzz_mags_compat_core
+local object_id, pack_results = core.object_id, core.pack_results
+local copy_value = core.deep_copy
+local section_of, inventory_refresh = core.section_of, core.inventory_refresh
+local find_ammo = core.find_ammo
+-- `this` is this script's own namespace table (see the compat core registry).
+core.register_service("aml", this)
+-- Legacy uses this seam session; native owns its own. A Reload hold owns the batch.
+local session = { active = false, is_unload = false, capacity = 0, interrupt_requested = false }
+local batch = { active = false, running = false, cancelled = false }
+local function log_error(fmt, ...) return core.log_error("AML: " .. fmt, ...) end
+local function log_info(fmt, ...) return core.log_info("AML: " .. fmt, ...) end
+local function controller_call(name, ...)
+	local controller = core.service("reload")
+	local fn = type(controller) == "table" and controller[name] or nil
+	if type(fn) ~= "function" then return nil, "Reload controller " .. tostring(name) .. " is unavailable" end
+	local results = pack_results(pcall(fn, ...))
+	if not results[1] then return nil, "Reload controller " .. tostring(name) .. " raised: " .. tostring(results[2]) end
+	return unpack(results, 2, results.n)
+end
+local function latch_batch_cancel(reason)
+	cancel_latched = true
+	if not batch.active then return end
+	batch.cancelled = true
+	batch.cancel_reason = reason or batch.cancel_reason or "cancelled"
+	batch.cancel_deadline = core.now_ms() + CANCEL_SETTLE_TIMEOUT_MS
+end
+local function mags_setting(key, fallback)
+	if not (magazines_mcm and type(magazines_mcm.get_config) == "function") then return fallback end
+	local ok, value = pcall(magazines_mcm.get_config, key)
+	if ok and value ~= nil then return value end
+	return fallback
+end
+local function bind_methods(owner, names)
+	local result = {}
+	if type(owner) ~= "table" then return nil, names[1] end
+	for i = 1, #names do
+		local name = names[i]
+		if type(owner[name]) ~= "function" then return nil, name end
+		result[name] = owner[name]
+	end
+	return result
+end
+local function bind_assignment()
+	if assignment then return true end
+	assignment = bind_methods(zzzz_mags_assignment_service,
+		{ "field_plan", "field_snapshot", "is_live", "read", "is_loadout_mag" })
+	if assignment then assignment.preserve_loose = zzzz_mags_assignment_service.preserve_loose end
+	return assignment ~= nil
+end
+local function action_in_progress()
+	if not mags_action then return false end
+	local ok, result = pcall(mags_action)
+	return ok and result and true or false
+end
+local function parent_is_inventory_box(obj)
+	if not obj then return false end
+	local ok, result = pcall(function()
+		local parent = obj:parent()
+		if not parent or parent:id() == 0 then return false end
+		local server_parent = alife_object(parent:id())
+		return server_parent and server_parent:clsid() == clsid.inventory_box_s or false
+	end)
+	return ok and result and true or false
+end
+local function restore_weapon_slot(slot)
+	local actor = db and db.actor
+	if not (actor and slot and slot ~= 0) then return end
+	local ok, active_slot = pcall(function() return actor:active_slot() end)
+	if ok and active_slot == 0 then pcall(function() actor:activate_slot(slot) end) end
+end
+local BLOCKING_MOVE_STATES = { "mcSprint", "mcJump", "mcFall" }
+local function movement_blocks_loading()
+	for _, state in ipairs(BLOCKING_MOVE_STATES) do
+		local ok, moving = pcall(IsMoveState, state)
+		if ok and moving then return true end
+	end
+	return false
+end
+local function exact_object(id)
+	if not (id and level and type(level.object_by_id) == "function") then return nil end
+	local ok, object = pcall(level.object_by_id, id)
+	return ok and object and object_id(object) == id and object or nil
+end
+local function loaded_count(id)
+	local data = id and core.data_for(id) or nil
+	return data and type(data.loaded) == "table" and #data.loaded or nil
+end
+local function resolve_batch_weapon()
+	if not batch.active then return nil end
+	local weapon = exact_object(batch.current_weapon_id)
+	if not weapon then return nil end
+	local actor = db and db.actor
+	if actor and batch.current_weapon_slot and batch.current_weapon_slot ~= 0 then
+		local slot_ok, slotted = pcall(function() return actor:item_in_slot(batch.current_weapon_slot) end)
+		if not (slot_ok and slotted and object_id(slotted) == batch.current_weapon_id) then return nil end
+	end
+	return weapon
+end
+local reinsert_held, settle_pending_held_eject, advance_bookend
+local function update_held_progress(held, count)
+	if held and held.loaded_started and batch.before_count ~= nil and held.magazine_id then
+		local after = loaded_count(held.magazine_id)
+		held.progressed = after ~= nil and after > batch.before_count or held.progressed
+	end
+	if count and held and held.progressed and not held.counted then
+		batch.completed, held.counted = (batch.completed or 0) + 1, true
+	end
+end
+local function finalize_batch(restore, reason)
+	if not batch.active then return false end
+	local slot, restore_id, completed = batch.restore_slot, batch.restore_weapon_id, batch.completed or 0
+	batch = { active = false, running = false, cancelled = false }
+	native_lock = nil
+	if restore and slot and restore_id and db and db.actor then
+		local ok, weapon = pcall(function() return db.actor:item_in_slot(slot) end)
+		if ok and object_id(weapon) == restore_id then restore_weapon_slot(slot) end
+	end
+	log_info("field batch %s | completed=%s", tostring(reason or "ended"), tostring(completed))
+	return true
+end
+local function finish_batch(restore, reason, force)
+	if not batch.active then return false end
+	local held = batch.held
+	if held and (held.phase == "pre_motion" or held.phase == "post_motion") then
+		controller_call("cancel_field_reload_motion", held.weapon_id,
+			held.phase == "pre_motion" and "pre" or "post")
+	end
+	if held and held.ejected and held.phase ~= "done" then
+		update_held_progress(held, false)
+		local ok, detail, retry = reinsert_held()
+		local deadline = batch.cancel_deadline or held.reinsert_deadline or held.eject_deadline or core.now_ms()
+		if not ok and retry and not force and core.now_ms() < deadline then
+			batch.cancelled, batch.cancel_deadline = true, deadline
+			return false
+		end
+		if not ok then
+			restore = false
+			log_error("held magazine left loose | weapon_id=%s | magazine_id=%s | %s",
+				tostring(held.weapon_id), tostring(held.magazine_id), tostring(detail))
+		else update_held_progress(held, true) end
+	end
+	return finalize_batch(restore, reason)
+end
+local function reset_session(restore)
+	local slot = session.restore_slot
+	session = { active = false, is_unload = false, capacity = 0, interrupt_requested = false }
+	if restore then restore_weapon_slot(slot) end
+	return slot
+end
+local function settle_batch_magazine(id, now)
+	batch.last_id, batch.running = id, false
+	batch.next_at = (now or core.now_ms()) + 50
+end
+local function active_query(fn, label)
+	if not fn then return false, false end
+	local ok, result = pcall(fn)
+	if ok then
+		active_query_errors[label] = false return result and true or false, false
+	end
+	if not active_query_errors[label] then log_error("%s query failed: %s", label, tostring(result)) end
+	active_query_errors[label] = true
+	return true, true
+end
+local function driver_is_animating() return active_query(driver_active, "driver animation") end
+local function finish_legacy_session(...)
+	local field_owned = session.field_owned and batch.active
+	local magazine_id = session.magazine_id
+	local slot = reset_session(false)
+	local results = pack_results(original.do_interrupt(...))
+	if field_owned then
+		if slot and not batch.restore_slot then batch.restore_slot = slot end
+		settle_batch_magazine(magazine_id)
+	else
+		restore_weapon_slot(slot)
+	end
+	return unpack(results, 1, results.n)
+end
+local function select_next_session_ammo(excluded_id)
+	local ammo, section = find_ammo(session.priority, session.exhausted, excluded_id)
+	session.ammo, session.ammo_section = ammo, section
+	return ammo
+end
+local function current_session_ammo()
+	local attempts, ammo = 0
+	while attempts <= #(session.priority or {}) do
+		ammo = session.ammo
+		if not ammo then return nil end
+		local ok, count, section, id = pcall(function()
+			return ammo:ammo_get_count(), ammo:section(), ammo:id()
+		end)
+		if ok and count and count > 0 and section and id then return ammo, count, section, id end
+		local exhausted_section = session.ammo_section or section
+		local replacement = exhausted_section and find_ammo({ exhausted_section }, {}, id) or nil
+		if replacement then
+			session.ammo, session.ammo_section = replacement, exhausted_section
+		else
+			if exhausted_section then session.exhausted[exhausted_section] = true end
+			select_next_session_ammo(id)
+		end
+		attempts = attempts + 1
+	end
+	return nil
+end
+local function store_mag_data(id, data)
+	local ok, err = pcall(magazine_binder.set_data, id, data)
+	if not ok then log_error("failed to store logical magazine %s: %s", tostring(id), tostring(err)) end
+	return ok
+end
+local function loaded_since(id, before_count)
+	local after_count = loaded_count(id)
+	return before_count ~= nil and after_count ~= nil and after_count > before_count
+end
+local function assignment_lock_state(id, expected)
+	if not expected or not bind_assignment() then return expected == nil, nil end
+	local live_ok, live = pcall(assignment.is_live, id)
+	local selected_ok, selected = pcall(assignment.is_loadout_mag, id)
+	local read_ok, preferred = pcall(assignment.read, id)
+	if not (live_ok and live and selected_ok and selected and read_ok and preferred) then return false, nil end
+	return preferred == expected, preferred
+end
+local function adopt_held_assignment(id, preferred)
+	local held = batch.active and batch.held or nil
+	if held and held.magazine_id == id and preferred then held.preferred = preferred end
+end
+local function batch_round_allowed(magazine)
+	if not batch.active then return true end
+	local id = object_id(magazine)
+	if batch.cancelled or cancel_latched or movement_blocks_loading() or id ~= batch.current_id then
+		latch_batch_cancel() return false
+	end
+	local weapon = resolve_batch_weapon()
+	if not (weapon and bind_assignment()) then latch_batch_cancel() return false end
+	local live_ok, live = pcall(assignment.is_live, id)
+	local read_ok, preferred = pcall(assignment.read, id)
+	local compatible_ok, compatible = pcall(magazine_binder.is_compatible, weapon, magazine)
+	if not (live_ok and live and read_ok and preferred and compatible_ok and compatible) then
+		latch_batch_cancel() return false
+	end
+	return true
+end
+local function session_mag_data(magazine, expected_unload)
+	if not session.active or session.is_unload ~= expected_unload or
+		object_id(magazine) ~= session.magazine_id then return nil, "ignored" end
+	if session.interrupt_requested or session.field_owned and not batch_round_allowed(magazine) then return nil, "ignored" end
+	if not expected_unload and session.lock_blocked then return nil, "locked" end
+	if not expected_unload and session.locked_ammo then
+		local valid, current = assignment_lock_state(session.magazine_id, session.locked_ammo)
+		if not valid then
+			session.lock_blocked = true
+			adopt_held_assignment(session.magazine_id, current)
+			if session.field_owned then latch_batch_cancel("assignment-changed") end
+			return nil, "locked"
+		end
+	end
+	local data = core.data_for(session.magazine_id)
+	if not (data and type(data.loaded) == "table") then return nil, "missing" end
+	return data
+end
+local function seam_load_one_round(magazine, capacity)
+	local data, reason = session_mag_data(magazine, false)
+	if not data then
+		if reason ~= "missing" then return true end
+		log_error("load stopped: missing logical magazine %s", tostring(session.magazine_id))
+		return true
+	end
+	capacity = tonumber(capacity) or session.capacity or 0
+	if #data.loaded >= capacity then return true end
+	local ammo, count, section, ammo_id = current_session_ammo()
+	if not ammo then return true end
+	local before, after = copy_value(data), copy_value(data)
+	after.loaded[#after.loaded + 1] = section
+	if not store_mag_data(session.magazine_id, after) then return true end
+	local consumed, consume_error = pcall(function()
+		if count > 1 then ammo:ammo_set_count(count - 1) return true end
+		local released = false
+		if alife_object and alife_release then
+			local server_ammo = alife_object(ammo_id)
+			if server_ammo then released = pcall(alife_release, server_ammo) end
+		end
+		if not released then ammo:ammo_set_count(0) end
+		return true
+	end)
+	if not consumed then
+		store_mag_data(session.magazine_id, before)
+		log_error("load stopped: failed to consume ammo | section=%s id=%s | %s",
+			tostring(section), tostring(ammo_id), tostring(consume_error))
+		return true
+	end
+	if count == 1 then select_next_session_ammo(ammo_id) end
+	inventory_refresh(2)
+	return #after.loaded >= capacity or session.ammo == nil
+end
+local function seam_unload_one_round(magazine)
+	local data = session_mag_data(magazine, true)
+	if not data or #data.loaded == 0 then return true end
+	local actor = db and db.actor
+	if not (actor and create_ammo) then
+		log_error("unload stopped: actor or create_ammo unavailable") return true
+	end
+	local before, after = copy_value(data), copy_value(data)
+	local round = table.remove(after.loaded)
+	if not store_mag_data(session.magazine_id, after) then return true end
+	local made, created = pcall(function()
+		return create_ammo(round, actor:position(), actor:level_vertex_id(),
+			actor:game_vertex_id(), actor:id(), 1)
+	end)
+	if not (made and type(created) == "table" and created[1] ~= nil) then
+		store_mag_data(session.magazine_id, before)
+		log_error("unload stopped: failed to create %s: %s", tostring(round), tostring(created))
+		return true
+	end
+	inventory_refresh(2)
+	return #after.loaded == 0
+end
+local function begin_legacy_session(plan, is_unload, field_owned)
+	if not (host_mode == "legacy" and driver_claim and plan and plan.magazine) then return false end
+	if session.active or action_in_progress() then return false end
+	local id = plan.magazine_id or object_id(plan.magazine)
+	if not id then return false end
+	session.active, session.is_unload = true, is_unload and true or false
+	session.magazine_id = id
+	session.ammo, session.ammo_section = plan.ammo, plan.ammo_section or section_of(plan.ammo)
+	session.priority = plan.priority or (session.ammo_section and { session.ammo_section }) or {}
+	session.exhausted, session.capacity = plan.exhausted or {}, tonumber(plan.capacity) or 0
+	session.restore_slot, session.interrupt_requested = nil, false
+	session.field_owned, cancel_latched = field_owned and true or false, false
+	session.locked_ammo = plan.locked_ammo or field_owned and plan.preferred or nil
+	if session.locked_ammo and not assignment_lock_state(id, session.locked_ammo) then
+		reset_session(false); return false
+	end
+	magazines.action_start_magload()
+	local ok, claimed = pcall(driver_claim, plan.magazine, session.is_unload,
+		session.capacity, tonumber(plan.delay) or 0.4)
+	if not ok or not claimed then
+		log_error("driver declined %s | magazine=%s | %s",
+			session.is_unload and "unload" or "load",
+			tostring(section_of(plan.magazine)),
+			ok and "claim returned false" or tostring(claimed))
+		if field_owned and batch.active then latch_batch_cancel("driver-declined") end
+		if driver_is_animating() then pcall(driver_interrupt) end
+		if session.active then finish_legacy_session() end
+		return false
+	end
+	return true
+end
+local function legacy_mag_plan(magazine, is_unload, capacity_fallback)
+	local section = section_of(magazine)
+	return { magazine = magazine, magazine_id = object_id(magazine),
+		capacity = tonumber(SYS_GetParam(2, section, "max_mag_size")) or capacity_fallback,
+		delay = magazines.get_mag_time and magazines.get_mag_time(section, is_unload) or 0.4 }
+end
+local function manual_load_plan(ammo, magazine, from_slot, to_slot)
+	if not EDDListType then return nil end
+	local actor_route = from_slot == EDDListType.iActorBag and
+		(to_slot == EDDListType.iActorBag or to_slot == EDDListType.iActorSlot)
+	local stash_route = from_slot == EDDListType.iDeadBodyBag and to_slot == EDDListType.iDeadBodyBag
+	local valid_route = actor_route or stash_route
+	if not valid_route then return nil end
+	if not (IsAmmo(ammo) and magazine_binder.is_magazine(magazine)) then return nil end
+	local ammo_section = section_of(ammo)
+	local ok, allowed = pcall(magazine_binder.get_magazine_caliber, magazine)
+	if not ok or type(allowed) ~= "table" then return nil end
+	local compatible
+	for i = 1, #allowed do if allowed[i] == ammo_section then compatible = true break end end
+	if not compatible then return nil end
+	if not bind_assignment() then return nil, true end
+	local id = object_id(magazine)
+	local selected_ok, selected = pcall(assignment.is_loadout_mag, id)
+	if not selected_ok then return nil, true end
+	local locked_ammo
+	if selected then
+		local read_ok, preferred = pcall(assignment.read, id)
+		if not (read_ok and preferred == ammo_section) then return nil, true end
+		locked_ammo = preferred
+	end
+	local box_mode = parent_is_inventory_box(ammo) and from_slot == EDDListType.iDeadBodyBag
+	-- Actor-inventory loading is always a visible, exact one-mag AML action.
+	-- Stashes retain Mags' configured fast/full behavior.
+	if not actor_route and (tonumber(mags_setting(box_mode and "loadstash_behavior" or "load_behavior", 0)) or 0) ~= 0 then return nil end
+	local plan = legacy_mag_plan(magazine, false, 20)
+	plan.ammo, plan.ammo_section = ammo, ammo_section
+	plan.priority, plan.exhausted = ammo_section and { ammo_section } or {}, {}
+	plan.locked_ammo = locked_ammo
+	return plan
+end
+local function install_manual_drag(original_drag)
+	if type(original_drag) ~= "function" then return end
+	magazines.on_item_drag_dropped = function(ammo, magazine, from_slot, to_slot, ...)
+		local plan, blocked = manual_load_plan(ammo, magazine, from_slot, to_slot)
+		if blocked then return end
+		if not plan then return original_drag(ammo, magazine, from_slot, to_slot, ...) end
+		if batch.active or host_in_flight and host_in_flight() or action_in_progress() then
+			interrupt()
+			return
+		end
+		if host_mode == "legacy" then
+			if not begin_legacy_session(plan, false, false) then
+				log_error("single-mag inventory load claim failed | magazine=%s", tostring(plan.magazine_id))
+			end
+			return
+		end
+		local before_count = loaded_count(plan.magazine_id)
+		native_lock = plan.locked_ammo and { magazine_id = plan.magazine_id, ammo = plan.locked_ammo } or nil
+		if native_lock and not assignment_lock_state(native_lock.magazine_id, native_lock.ammo) then
+			native_lock = nil; return
+		end
+		local ok, started = pcall(magazines.begin_mag_load, plan.magazine, plan.ammo)
+		local progressed = loaded_since(plan.magazine_id, before_count)
+		if not host_in_flight() then native_lock = nil end
+		if not ok or not started and not progressed and not host_in_flight() then
+			log_error("native single-mag inventory load claim failed | magazine=%s | %s",
+				tostring(plan.magazine_id), ok and "begin returned false" or tostring(started))
+		end
+		-- A valid AML route is fail-closed: never fall through to instant Mags loading.
+	end
+	original.on_item_drag_dropped = original_drag
+end
+local function guarded_native_round(original_round, check_lock, magazine, ...)
+	if cancel_latched or batch.active and not batch_round_allowed(magazine) then return true end
+	if check_lock and native_lock then
+		if native_lock.blocked then return true end
+		local id = object_id(magazine)
+		local valid, current = false, nil
+		if id == native_lock.magazine_id then
+			valid, current = assignment_lock_state(id, native_lock.ammo)
+		end
+		if not valid then
+			adopt_held_assignment(id, current)
+			native_lock.blocked = true
+			if batch.active then latch_batch_cancel("assignment-changed") end
+			return true
+		end
+	end
+	return original_round(magazine, ...)
+end
+-- The magazines members each host path replaces (see install_host).  Their
+-- install outcome is reported to the compat core's seam registry only once
+-- AML itself is present and speaks Contract 1: without AML the bridge is
+-- simply inactive, which the Reload controller's installed line already shows.
+local NATIVE_HOOKS = { "load_one_round", "unload_one_round", "do_interrupt", "on_item_drag_dropped" }
+local LEGACY_HOOKS = { "ensure_load_holster", "is_loading_mag", "load_one_round", "unload_one_round",
+	"do_interrupt", "do_interrupt_magload", "func_unload_ammo", "on_item_drag_dropped" }
+local function record_hooks(list, missing)
+	for i = 1, #list do core.record_seam("magazines." .. list[i], missing) end
+end
+-- AML keeps its own settings on Mags' MCM page.  AML Update 10 (its installer
+-- says 0.9 Beta) reads aml_camera_effects there whenever a load starts, from
+-- its own actor_on_update tick.  Mags Reloaded 1.05 has no such setting and its
+-- get_config builds the MCM path from a table that lacks the key, so the read
+-- raises, unprotected, inside that callback.  An aml_ setting the installed
+-- Mags cannot resolve therefore reads as unset, and AML leaves its camera
+-- effect off; every other setting goes straight to Mags, errors included.
+-- Installed with either host path, so an inactive bridge still replaces
+-- nothing, and only once: install_host returns early after that.
+local AML_SETTING_PREFIX = "aml_"
+local unresolved_settings = {}
+local function install_setting_guard()
+	local absent = core.missing_member(magazines_mcm, "magazines_mcm", { "get_config" })
+	if absent then return absent end
+	local resolve = magazines_mcm.get_config
+	magazines_mcm.get_config = function(key, ...)
+		if type(key) ~= "string" or string.find(key, AML_SETTING_PREFIX, 1, true) ~= 1 then
+			return resolve(key, ...)
+		end
+		local ok, value = pcall(resolve, key, ...)
+		if ok then return value end
+		if not unresolved_settings[key] then
+			unresolved_settings[key] = true
+			log_info("Mags MCM has no setting %s; read as unset | %s", key, tostring(value))
+		end
+		return nil
+	end
+	return nil
+end
+local function install_host()
+	if host_mode ~= "inactive" then return true end
+	if not (magazines and magazine_binder and magazines_aml) then
+		inactive_reason = "missing magazines, magazine_binder, or magazines_aml" return false
+	end
+	if tonumber(magazines_aml.CONTRACT) ~= CONTRACT or type(magazines_aml.get_driver) ~= "function" then
+		inactive_reason = "AML Contract 1 driver unavailable" return false
+	end
+	local driver_ok, result = pcall(magazines_aml.get_driver)
+	local driver = driver_ok and bind_methods(result, { "claim", "interrupt", "is_animating" }) or nil
+	if not driver then
+		inactive_reason = driver_ok and "AML driver table is incomplete" or tostring(result) return false
+	end
+	driver_claim, driver_interrupt, driver_active = driver.claim, driver.interrupt, driver.is_animating
+	if magazines.SEAM_CONTRACT ~= nil then
+		local native, absent = bind_methods(magazines, {
+			"is_loading_mag", "ensure_load_holster", "load_one_round", "unload_one_round", "do_interrupt",
+		})
+		if tonumber(magazines.SEAM_CONTRACT) == CONTRACT and native then
+			original.load_one_round, original.unload_one_round, original.do_interrupt =
+				native.load_one_round, native.unload_one_round, native.do_interrupt
+			local native_drag = magazines.on_item_drag_dropped
+			native_is_loading, native_has_begin, native_has_drag = native.is_loading_mag,
+				type(magazines.begin_mag_load) == "function", type(magazines.on_item_drag_dropped) == "function"
+			mags_action = type(magazines.action_in_progress) == "function" and magazines.action_in_progress or nil
+			magazines.load_one_round = function(...) return guarded_native_round(original.load_one_round, true, ...) end
+			magazines.unload_one_round = function(...) return guarded_native_round(original.unload_one_round, false, ...) end
+			magazines.do_interrupt = function(...)
+				native_lock = nil
+				if batch.active then
+					if driver_is_animating() then latch_batch_cancel() else cancel_latched = true end
+				end
+				return original.do_interrupt(...)
+			end
+			host_mode, inactive_reason = "native", nil
+			core.record_seam("magazines_mcm.get_config", install_setting_guard())
+			if native_has_drag then install_manual_drag(native_drag) end
+			record_hooks(NATIVE_HOOKS, nil)
+			if not native_has_drag then core.record_seam("magazines.on_item_drag_dropped", "magazines.on_item_drag_dropped") end
+			return true
+		end
+		record_hooks(NATIVE_HOOKS, absent and "magazines." .. absent or "magazines.SEAM_CONTRACT")
+		inactive_reason = "incompatible or incomplete Mags AML contract" return false
+	end
+	local legacy, missing = bind_methods(magazines, {
+		"on_item_drag_dropped", "func_unload_ammo", "action_start_magload",
+		"action_in_progress", "do_interrupt", "do_interrupt_magload",
+	})
+	if missing then
+		record_hooks(LEGACY_HOOKS, "magazines." .. missing)
+		inactive_reason = "missing magazines." .. missing return false
+	end
+	original.on_item_drag_dropped, original.func_unload_ammo = legacy.on_item_drag_dropped, legacy.func_unload_ammo
+	original.do_interrupt, original.do_interrupt_magload = legacy.do_interrupt, legacy.do_interrupt_magload
+	mags_action = legacy.action_in_progress
+	magazines.SEAM_CONTRACT = CONTRACT
+	magazines.ensure_load_holster = function()
+		local actor = db and db.actor
+		if not actor then return end
+		if session.restore_slot == nil then
+			local ok, slot = pcall(function() return actor:active_slot() end)
+			if ok and slot and slot ~= 0 then session.restore_slot = slot end
+		end
+		pcall(function() actor:activate_slot(0) end)
+	end
+	magazines.is_loading_mag = function() return session.active and true or false end
+	magazines.load_one_round, magazines.unload_one_round = seam_load_one_round, seam_unload_one_round
+	magazines.do_interrupt = function(...)
+		if not session.active then return original.do_interrupt(...) end
+		if not driver_is_animating() then return finish_legacy_session(...) end
+		if session.interrupt_requested then return end
+		session.interrupt_requested = true
+		if session.field_owned and batch.active then latch_batch_cancel() else cancel_latched = true end
+		local ok, err = pcall(driver_interrupt)
+		if not ok then
+			log_error("driver interrupt failed: %s", tostring(err)) return finish_legacy_session(...)
+		end
+		-- The driver's hide animation re-enters this wrapper to finish ACTION_LOAD_MAG.
+	end
+	magazines.do_interrupt_magload = function(...)
+		if session.active then return magazines.do_interrupt(...) end
+		return original.do_interrupt_magload(...)
+	end
+	magazines.func_unload_ammo = function(magazine, ...)
+		if batch.active then interrupt() return end
+		if action_in_progress() then magazines.do_interrupt() return end
+		if magazine_binder.is_magazine(magazine) and not parent_is_inventory_box(magazine) and
+			(tonumber(mags_setting("unload_behavior", 0)) or 0) == 0 then
+			local data = core.data_for(object_id(magazine))
+			if data and type(data.loaded) == "table" and #data.loaded > 0 and
+				begin_legacy_session(legacy_mag_plan(magazine, true, #data.loaded), true) then return end
+		end
+		return original.func_unload_ammo(magazine, ...)
+	end
+	host_mode, inactive_reason = "legacy", nil
+	core.record_seam("magazines_mcm.get_config", install_setting_guard())
+	install_manual_drag(original.on_item_drag_dropped)
+	record_hooks(LEGACY_HOOKS, nil)
+	return true
+end
+function available() return host_mode ~= "inactive" and bind_assignment() end
+local function host_active()
+	if host_mode == "legacy" then return session.active and true or false end
+	if host_mode == "native" then
+		local running
+		running, native_active_query_failed = active_query(native_is_loading, "native session")
+		return running
+	end
+	native_active_query_failed = false
+	return false
+end
+host_in_flight = function() return host_active() or host_mode == "native" and driver_is_animating() or false end
+local function held_weapon(held)
+	local actor = db and db.actor
+	if not (actor and held and held.weapon_id and held.weapon_slot) then return nil end
+	local ok, weapon = pcall(function() return actor:item_in_slot(held.weapon_slot) end)
+	return ok and weapon and object_id(weapon) == held.weapon_id and weapon or nil
+end
+local function held_retry(held, reason)
+	local now = core.now_ms()
+	local deadline = held.phase == "await_eject" and held.eject_deadline or held.reinsert_deadline
+	if not deadline then
+		deadline = now + CANCEL_SETTLE_TIMEOUT_MS
+		held.reinsert_deadline = deadline
+	end
+	return false, reason, now < deadline
+end
+local function installed_exact(held, weapon, expected)
+	local data = core.data_for(held.weapon_id)
+	if not (data and data.is_weapon and data.section == held.magazine_section and
+		type(data.loaded) == "table" and not (held.magazine_id and core.data_for(held.magazine_id))) then return false end
+	if expected and not core.deep_equal(data, expected) then return false end
+	local read_ok, preferred = pcall(assignment.read, held.weapon_id, data)
+	local count_ok, count = pcall(function() return weapon:get_ammo_in_magazine() end)
+	return read_ok and preferred == held.preferred and count_ok and count == #data.loaded
+end
+local function restore_held_snapshot(held, weapon, reason)
+	local snapshot = held and held.installed_snapshot
+	if not (snapshot and snapshot.is_weapon and snapshot.section == held.magazine_section and
+		type(snapshot.loaded) == "table" and weapon) then return false end
+	snapshot = copy_value(snapshot)
+	if not store_mag_data(held.weapon_id, snapshot) then return false end
+	local prep_ok, prep_err = pcall(magazines.prep_weapon, weapon, false)
+	if not prep_ok or not installed_exact(held, weapon, snapshot) then
+		held.restore_pending = true
+		held.reinsert_deadline = held.reinsert_deadline or core.now_ms() + CANCEL_SETTLE_TIMEOUT_MS
+		if not held.restore_error_logged then
+			held.restore_error_logged = true
+			log_error("held binder restore is waiting for engine sync | weapon_id=%s | %s",
+				tostring(held.weapon_id), tostring(prep_err or reason))
+		end
+		return false
+	end
+	held.restore_pending, held.restore_error_logged = nil, nil
+	held.ejected, held.magazine_id = false, nil
+	log_info("restored held weapon after failed ejection | weapon_id=%s | %s",
+		tostring(held.weapon_id), tostring(reason))
+	return true
+end
+local function preserve_held_loose(held, expected, reason)
+	local weapon_data = held and core.data_for(held.weapon_id) or nil
+	if not (held and held.magazine_id and weapon_data and weapon_data.is_weapon and
+		weapon_data.section == "no_mag") then
+		return false, "held weapon is not in the exact empty-magazine state", false
+	end
+	if type(assignment.preserve_loose) ~= "function" then
+		return false, "loose preservation service is unavailable", false
+	end
+	local results = pack_results(pcall(assignment.preserve_loose,
+		held.magazine_id, expected, held.preferred))
+	if not results[1] then return false, "loose preservation raised: " .. tostring(results[2]), false end
+	if results[2] == nil then return false, results[3] or "loose ownership is still settling", true end
+	if not results[2] then return false, results[3] or "loose ownership did not verify", false end
+	held.phase, held.left_loose = "done", true
+	log_info("held magazine retained loose | weapon_id=%s | magazine_id=%s | %s",
+		tostring(held.weapon_id), tostring(held.magazine_id), tostring(reason))
+	return true, results[3], false
+end
+reinsert_held = function(normalize_chamber)
+	local held = batch.active and batch.held or nil
+	if not (held and held.ejected) or held.phase == "done" then return true end
+	local weapon = held_weapon(held)
+	if not weapon then return false, "exact held weapon is no longer in its slot", false end
+	local weapon_data = core.data_for(held.weapon_id)
+	local source_data = held.magazine_id and core.data_for(held.magazine_id) or nil
+	if weapon_data and weapon_data.is_weapon and weapon_data.section == held.magazine_section and not source_data then
+		if held.restore_pending and not restore_held_snapshot(held, weapon, "retry") then
+			return held_retry(held, "waiting for restored held weapon engine sync")
+		end
+		local expected = held.expected_reinsert or held.installed_snapshot
+		if expected and not installed_exact(held, weapon, expected) then
+			local repaired = store_mag_data(held.weapon_id, copy_value(expected)) and
+				pcall(magazines.prep_weapon, weapon, false) and installed_exact(held, weapon, expected)
+			if not repaired then return held_retry(held, "waiting to repair exact installed magazine record") end
+		end
+		if not installed_exact(held, weapon, expected) then
+			held.phase, held.reinserted, held.assignment_failed = "done", true, true
+			log_error("held magazine installed without exact binder/engine state | weapon_id=%s | magazine_id=%s",
+				tostring(held.weapon_id), tostring(held.magazine_id))
+			return true, "exact binder/engine state was not restored", false
+		end
+		held.phase, held.reinserted = "done", true
+		return true
+	end
+	if not (weapon_data and weapon_data.is_weapon and weapon_data.section == "no_mag") then
+		return false, "held weapon no longer has the expected empty magazine record", false
+	end
+	if not held.magazine_id then return held_retry(held, "waiting for generated magazine id") end
+	local magazine = exact_object(held.magazine_id)
+	if not (magazine and source_data) then return held_retry(held, "waiting for generated magazine object") end
+	if source_data.is_weapon or source_data.section ~= held.magazine_section then
+		return false, "generated magazine record changed", false
+	end
+	local live_ok, live = pcall(assignment.is_live, held.magazine_id)
+	if not (live_ok and live) then return held_retry(held, "waiting for generated magazine ownership") end
+	local read_ok, preferred = pcall(assignment.read, held.magazine_id, source_data)
+	if not (read_ok and preferred == held.preferred) then
+		return held_retry(held, "waiting for generated magazine assignment")
+	end
+	if host_in_flight() or driver_is_animating() or action_in_progress() then
+		return held_retry(held, "waiting for AML/Mags to settle")
+	end
+	local retained = held.retained_chamber
+	if normalize_chamber then
+		local prepared, prepare_detail, prepared_chamber = controller_call("prepare_field_reinsert",
+			held.weapon_id, held.magazine_id, held.magazine_section)
+		if prepared == "retry" then return held_retry(held, prepare_detail or "waiting to prepare exact reinsertion") end
+		if prepared ~= "ready" then return false, prepare_detail or "exact reinsertion preparation failed", false end
+		held.post_empty = prepare_detail and true or false
+		held.retained_chamber = prepared_chamber
+		retained = prepared_chamber
+	end
+	local compatible_ok, compatible = pcall(magazine_binder.is_compatible, weapon, magazine)
+	if not (compatible_ok and compatible) then return false, "generated magazine is no longer compatible", false end
+	local expected = copy_value(source_data)
+	expected.is_weapon, expected.aml_preferred_ammo, expected.aml_assignment_slot =
+		true, held.preferred, held.weapon_slot
+	if retained then expected.loaded[#expected.loaded + 1] = retained end
+	held.expected_reinsert = expected
+	local loose_expected = copy_value(source_data)
+	held.phase = "reinserting"
+	local ok, err = pcall(magazines.load_weapon, weapon, magazine)
+	weapon_data, source_data = core.data_for(held.weapon_id), core.data_for(held.magazine_id)
+	if weapon_data and weapon_data.is_weapon and weapon_data.section == held.magazine_section and not source_data then
+		if not ok then
+			log_error("canonical load_weapon raised after exact commit | weapon_id=%s | magazine_id=%s | %s",
+				tostring(held.weapon_id), tostring(held.magazine_id), tostring(err))
+		end
+		log_info("held magazine reinserted | weapon_id=%s | magazine_id=%s",
+			tostring(held.weapon_id), tostring(held.magazine_id))
+		return reinsert_held(false)
+	end
+	if source_data then
+		local preserved, preserve_detail, retry = preserve_held_loose(held, loose_expected,
+			ok and "canonical load_weapon declined" or "canonical load_weapon raised")
+		if preserved then
+			return false, ok and "canonical load_weapon declined; exact magazine retained loose" or
+				"canonical load_weapon raised; exact magazine retained loose", false
+		end
+		if retry then return held_retry(held, preserve_detail) end
+	end
+	return false, ok and "canonical load_weapon did not install the exact magazine" or
+		"canonical load_weapon raised: " .. tostring(err), false
+end
+function force_retain_ejected_magazine(weapon_id, magazine_id)
+	local held = batch.active and batch.held or nil
+	if not (held and (held.phase == "ejecting" or held.phase == "await_eject") and
+		held.weapon_id == weapon_id and magazine_id) then return false end
+	if held.magazine_id and held.magazine_id ~= magazine_id then return false end
+	held.magazine_id, held.ejected = magazine_id, true
+	if held.phase == "ejecting" then held.phase = "await_eject" end
+	held.eject_deadline = held.eject_deadline or core.now_ms() + EJECT_WAIT_TIMEOUT_MS
+	return true
+end
+local function await_held_eject()
+	local held = batch.held
+	local weapon = held_weapon(held)
+	if not weapon then return false, "exact held weapon changed", false end
+	local weapon_data = core.data_for(held.weapon_id)
+	if not (weapon_data and weapon_data.is_weapon and weapon_data.section == "no_mag") then
+		return false, "held weapon did not reach the empty-magazine state", false
+	end
+	if not held.magazine_id then return held_retry(held, "waiting for generated magazine id") end
+	local magazine, data = exact_object(held.magazine_id), core.data_for(held.magazine_id)
+	if not (magazine and data) and core.now_ms() >= (held.eject_deadline or 0) and settle_pending_held_eject() then
+		magazine, data = exact_object(held.magazine_id), core.data_for(held.magazine_id)
+	end
+	if not (magazine and data and not data.is_weapon) then
+		return held_retry(held, "waiting for generated magazine record")
+	end
+	if data.section ~= held.magazine_section then return false, "generated magazine section changed", false end
+	local live_ok, live = pcall(assignment.is_live, held.magazine_id)
+	local read_ok, preferred = pcall(assignment.read, held.magazine_id, data)
+	if not (live_ok and live and read_ok and preferred == held.preferred) then
+		return held_retry(held, "waiting for generated magazine transfer")
+	end
+	local compatible_ok, compatible = pcall(magazine_binder.is_compatible, weapon, magazine)
+	if not (compatible_ok and compatible) then return false, "generated magazine is incompatible", false end
+	return true
+end
+local function skip_held(reason)
+	local held = batch.held
+	if not held or held.phase == "done" then return end
+	held.phase, held.skipped = "done", true
+	batch.total = math.max(0, (batch.total or 1) - 1)
+	log_info("held magazine skipped | weapon_id=%s | %s", tostring(held.weapon_id), tostring(reason))
+end
+local function begin_held_eject()
+	local held = batch.held
+	if not held then return "skip" end
+	local weapon = core.active_weapon()
+	if not (weapon and object_id(weapon) == held.weapon_id and held_weapon(held)) then
+		skip_held("held weapon changed before ejection") return "skip"
+	end
+	local ok, readiness = pcall(core.readiness, weapon, held.weapon_id)
+	if not ok or readiness ~= "healthy" or action_in_progress() or host_in_flight() then
+		skip_held("weapon was no longer ready") return "skip"
+	end
+	local prepared, prepare_detail = controller_call("prepare_field_eject", held.weapon_id, held.magazine_section)
+	if prepared ~= "ready" then
+		skip_held(prepare_detail or "held chamber preparation failed") return "skip"
+	end
+	local data = core.data_for(held.weapon_id)
+	local read_ok, preferred = pcall(assignment.read, held.weapon_id, data)
+	if not (data and data.is_weapon and data.section == held.magazine_section and
+		read_ok and preferred == held.preferred) then
+		skip_held("inserted magazine changed before ejection") return "skip"
+	end
+	held.installed_snapshot, held.eject_snapshot = copy_value(data), copy_value(data)
+	local retain_ok, retains = pcall(magazines.retain_round, weapon)
+	if not retain_ok then
+		skip_held("could not query retained chamber before ejection") return "skip"
+	elseif retains and #held.eject_snapshot.loaded > 0 then
+		held.retained_chamber = held.eject_snapshot.loaded[#held.eject_snapshot.loaded]
+		table.remove(held.eject_snapshot.loaded)
+	else held.retained_chamber = nil end
+	held.eject_snapshot.is_weapon = false
+	held.phase = "ejecting"
+	local eject_ok, new_id = pcall(magazines.eject_magazine, weapon)
+	new_id = new_id or held.magazine_id
+	if not (eject_ok and new_id) then
+		local after = core.data_for(held.weapon_id)
+		if after and after.is_weapon and after.section ~= "no_mag" then
+			skip_held("canonical ejection declined") return "skip"
+		end
+		held.ejected = after and after.is_weapon and after.section == "no_mag" or held.ejected
+		if held.ejected and restore_held_snapshot(held, weapon, new_id or "no generated id") then
+			skip_held("canonical ejection failed; exact binder restored") return "skip"
+		end
+		log_error("held magazine ejection failed | weapon_id=%s | %s",
+			tostring(held.weapon_id), tostring(new_id or "no generated id"))
+		return "failed"
+	end
+	held.magazine_id, held.ejected, held.phase = new_id, true, "await_eject"
+	held.eject_deadline = held.eject_deadline or core.now_ms() + EJECT_WAIT_TIMEOUT_MS
+	batch.current_weapon_id, batch.current_weapon_slot = held.weapon_id, held.weapon_slot
+	local actor = db and db.actor
+	if actor then pcall(function() actor:activate_slot(0) end) end
+	batch.next_at = core.now_ms() + 25
+	log_info("held magazine ejected for field load | weapon_id=%s | magazine_id=%s",
+		tostring(held.weapon_id), tostring(new_id))
+	return "started"
+end
+function active() return batch.active or host_in_flight() end
+function interrupt(reason)
+	local batch_active = batch.active
+	if batch_active then latch_batch_cancel(reason or "cancelled") end
+	if not host_in_flight() then
+		if batch_active then batch.next_at = core.now_ms() end
+		return batch_active
+	end
+	local ok, err = pcall(magazines.do_interrupt)
+	if not ok then log_error("interrupt failed: %s", tostring(err)) end
+	if host_mode == "native" and driver_is_animating() then
+		local driver_ok, driver_err = pcall(driver_interrupt)
+		if not driver_ok then log_error("native driver interrupt failed: %s", tostring(driver_err)) end
+	end
+	return ok
+end
+local function claim_native(plan)
+	if host_in_flight() then return "consumed" end
+	local locked_ammo = plan.locked_ammo or plan.preferred
+	native_lock = locked_ammo and { magazine_id = plan.magazine_id, ammo = locked_ammo } or nil
+	if native_lock and not assignment_lock_state(native_lock.magazine_id, native_lock.ammo) then
+		native_lock = nil; return "consumed"
+	end
+	if native_has_begin then
+		local before_count = loaded_count(plan.magazine_id)
+		local ok, started = pcall(magazines.begin_mag_load, plan.magazine, plan.ammo)
+		local progressed = loaded_since(plan.magazine_id, before_count)
+		if not ok then
+			native_lock = nil
+			log_error("native begin_mag_load failed: %s", tostring(started)) return "consumed"
+		end
+		if started or progressed then
+			if not host_in_flight() then native_lock = nil end
+			return "started"
+		end
+		if host_in_flight() then return native_active_query_failed and "consumed" or "started" end
+	end
+	-- Fast legacy fallback may consume the gesture without exposing a session.
+	if native_has_drag and EDDListType then
+		local drag = original.on_item_drag_dropped or magazines.on_item_drag_dropped
+		local ok, err = pcall(drag, plan.ammo, plan.magazine,
+			EDDListType.iActorBag, EDDListType.iActorBag)
+		if not ok then log_error("native field-load fallback failed: %s", tostring(err)) end
+		if ok and host_in_flight() then return native_active_query_failed and "consumed" or "started" end
+	end
+	native_lock = nil
+	return "consumed"
+end
+local function log_batch_started()
+	if batch.logged_start then return end
+	batch.logged_start = true
+	local held_first = batch.held and not batch.held.skipped and true or false
+	log_info("field batch started | magazines=%s | weapon_groups=%s | held_first=%s", tostring(batch.total), tostring(#(batch.groups or {}) + (held_first and 1 or 0)), tostring(held_first))
+end
+local function bookend_wait(first)
+	batch.next_at = core.now_ms() + 25
+	return first and "started" or "consumed"
+end
+local function finish_held_cycle(held, detail)
+	local weapon = held_weapon(held)
+	local expected = held and (held.expected_reinsert or held.installed_snapshot) or nil
+	if not (held and held.post_reinserted and held.reinserted and not held.assignment_failed and
+		weapon and installed_exact(held, weapon, expected)) then
+		log_error("held cycle lost exact reinsertion state | weapon_id=%s | %s",
+			tostring(held and held.weapon_id), tostring(detail))
+		finish_batch(true, "held-reinsert-state-lost")
+		return "consumed"
+	end
+	held.phase = "done"
+	batch.current_weapon_id, batch.current_weapon_slot = nil, nil
+	if held.cancel_closing or batch.cancelled then
+		update_held_progress(held, true)
+		log_info("held cancellation closing complete | weapon_id=%s | %s",
+			tostring(held.weapon_id), tostring(detail or "post-animation-complete"))
+		finalize_batch(true, batch.cancel_reason or "cancelled")
+		return "consumed"
+	end
+	log_info("held magazine cycle complete; resuming loose batch | weapon_id=%s | %s",
+		tostring(held.weapon_id), tostring(detail or "post-animation-complete"))
+	return "resume"
+end
+local function bookend_activate(held, now)
+	local actor = db and db.actor
+	if not actor then return false, "actor unavailable" end
+	local ok, direct = pcall(function() return actor:active_item() end)
+	if ok and direct and object_id(direct) == held.weapon_id then return true end
+	if now >= (held.next_activate or 0) then
+		pcall(function() actor:activate_slot(held.weapon_slot) end)
+		held.next_activate = now + 100
+	end
+	return false, now >= (held.bookend_deadline or 0) and "inventory/engine did not activate the exact held weapon" or nil
+end
+advance_bookend = function(first)
+	local held, now = batch.held, core.now_ms()
+	if not held then return "resume" end
+	local pre = held.phase == "pre_activate" or held.phase == "pre_motion"
+	local post = held.phase == "post_activate" or held.phase == "post_motion"
+	if not (pre or post) then return "resume" end
+	if held.phase == "pre_motion" or held.phase == "post_motion" then
+		local side = pre and "pre" or "post"
+		local status, detail = controller_call("field_reload_motion_status", held.weapon_id, side)
+		if status == "running" then return bookend_wait(first) end
+		if pre then
+			if status ~= "complete" then
+				log_error("pre-field reload motion failed closed | %s", tostring(detail))
+				finish_batch(true, "pre-animation-failed")
+				return "consumed"
+			end
+			local result = begin_held_eject()
+			if result == "started" then return bookend_wait(first) end
+			if result == "skip" then return "resume" end
+			finish_batch(true, "held-eject-failed") return "consumed"
+		end
+		if status ~= "complete" then log_info("post-field reload motion ended early | %s", tostring(detail)) end
+		return finish_held_cycle(held, status == "complete" and "post-animation-complete" or detail)
+	end
+	local active, activate_detail = bookend_activate(held, now)
+	if not active then
+		if activate_detail then
+			log_error("field reload bookend activation failed | phase=%s | %s", tostring(held.phase), tostring(activate_detail))
+			if pre then
+				finish_batch(true, "pre-animation-activation-failed")
+			elseif held.cancel_closing and not held.post_reinserted then
+				local loose = core.data_for(held.magazine_id)
+				local preserved, preserve_detail, retry = preserve_held_loose(held, copy_value(loose),
+					"closing activation unavailable")
+				if not preserved and retry and now < (held.bookend_deadline or now) then return bookend_wait(first) end
+				if preserved then
+					batch.current_weapon_id, batch.current_weapon_slot = nil, nil
+					finalize_batch(true, "cancelled-magazine-loose")
+				else
+					log_error("could not preserve cancelled held magazine loose | weapon_id=%s | %s",
+						tostring(held.weapon_id), tostring(preserve_detail))
+					finish_batch(true, "held-loose-preservation-failed", true)
+				end
+			else
+				local inserted, insert_detail, retry = reinsert_held(true)
+				if not inserted and retry and now < (held.reinsert_deadline or now) then return bookend_wait(first) end
+				if inserted and not held.assignment_failed then
+					held.post_reinserted = true
+					return finish_held_cycle(held, "post-activation-unavailable")
+				end
+				log_error("exact held reinsertion after activation failure failed | weapon_id=%s | %s",
+					tostring(held.weapon_id), tostring(insert_detail))
+				finish_batch(true, "held-reinsert-failed")
+			end
+			return "consumed"
+		end
+		return bookend_wait(first)
+	end
+	if post and not held.post_reinserted then
+		if held.cancel_closing and held.post_empty == nil then held.post_empty = held.retained_chamber == nil end
+		local inserted, insert_detail, retry = reinsert_held(not held.cancel_closing)
+		if not inserted and retry and now < held.bookend_deadline then return bookend_wait(first) end
+		if not inserted or held.assignment_failed then
+			log_error("exact held reinsertion failed | weapon_id=%s | %s", tostring(held.weapon_id), tostring(insert_detail))
+			if held.left_loose then
+				batch.current_weapon_id, batch.current_weapon_slot = nil, nil
+				finalize_batch(true, "cancelled-magazine-loose")
+			else finish_batch(true, "held-reinsert-failed") end
+			return "consumed"
+		end
+		held.phase, held.post_reinserted = "post_activate", true
+	end
+	local side, empty = pre and "pre" or "post", pre and held.pre_empty or held.post_empty
+	local status, detail = controller_call("start_field_reload_motion",
+		held.weapon_id, held.magazine_section, empty, side)
+	if status == "started" then
+		held.phase = pre and "pre_motion" or "post_motion"
+		return bookend_wait(first)
+	end
+	if status == "retry" and now < held.bookend_deadline then return bookend_wait(first) end
+	if pre then
+		if status == "skipped" then
+			local result = begin_held_eject()
+			if result == "started" then return bookend_wait(first) end
+			if result == "skip" then return "resume" end
+			finish_batch(true, "held-eject-failed")
+		else
+			log_error("pre-field reload motion could not start; leaving magazine installed | %s", tostring(detail))
+			finish_batch(true, "pre-animation-failed")
+		end
+	else
+		if status ~= "skipped" then log_info("post-field reload motion skipped | %s", tostring(detail)) end
+		return finish_held_cycle(held, status == "skipped" and "post-animation-unavailable" or detail)
+	end
+	return "consumed"
+end
+local function advance_cancelled_batch(running, now)
+	if not batch.active then return "consumed" end
+	if running or driver_is_animating() then
+		if now >= (batch.cancel_deadline or now + CANCEL_SETTLE_TIMEOUT_MS) then
+			finish_batch(true, "cancel-settle-timeout", true)
+		end
+		return "consumed"
+	end
+	local held = batch.held
+	if not (held and held.ejected) or held.phase == "done" then
+		finish_batch(true, batch.cancel_reason or "cancelled")
+		return "consumed"
+	end
+	if held.phase == "ejecting" or held.phase == "await_eject" then
+		local ready, detail, retry = await_held_eject()
+		if not ready then
+			if retry and now < (held.eject_deadline or now) then
+				batch.next_at = now + 25
+				return "consumed"
+			end
+			log_error("cancelled held ejection did not settle | weapon_id=%s | %s",
+				tostring(held.weapon_id), tostring(detail))
+			finish_batch(true, "cancel-eject-failed", true)
+			return "consumed"
+		end
+		held.phase = "ready"
+	end
+	update_held_progress(held, false)
+	batch.running, batch.last_id, batch.current_id, batch.before_count = false, nil, nil, nil
+	held.cancel_closing = true
+	if held.phase ~= "post_activate" and held.phase ~= "post_motion" then
+		held.phase, held.bookend_deadline, held.next_activate = "post_activate",
+			now + BOOKEND_ACTIVATE_TIMEOUT_MS, 0
+	end
+	batch.current_weapon_id, batch.current_weapon_slot = held.weapon_id, held.weapon_slot
+	return advance_bookend(false)
+end
+local function advance_batch(first)
+	local plan, reason, detail
+	if not bind_assignment() then
+		reason, detail = "planner_failed", "assignment service unavailable"
+	else
+		local held = batch.held
+		if held and (held.phase == "pre_activate" or held.phase == "pre_motion" or
+			held.phase == "post_activate" or held.phase == "post_motion") then
+			local result = advance_bookend(first)
+			if result ~= "resume" then return result end
+		end
+		if held and held.phase == "await_eject" then
+			local ready, wait_detail, retry = await_held_eject()
+			if not ready then
+				if retry then batch.next_at = core.now_ms() + 25 return first and "started" or "consumed" end
+				reason, detail = "held-eject-failed", wait_detail
+			else
+				held.phase = "ready"
+			end
+		end
+		if not reason and held and held.phase == "loading" then
+			if batch.last_id ~= held.magazine_id then
+				reason, detail = "held-session-lost", "held AML session ended without the exact magazine id"
+			else
+				local after = loaded_count(held.magazine_id)
+				local progressed = after ~= nil and after > (batch.before_count or after)
+				held.progressed = progressed or held.progressed
+				batch.last_id, batch.current_id, batch.before_count = nil, nil, nil
+				if not progressed then reason, detail = "held-stalled", "held magazine made no loading progress"
+				else
+					batch.completed, held.counted = (batch.completed or 0) + 1, true
+					held.phase, held.bookend_deadline, held.next_activate = "post_activate",
+						core.now_ms() + BOOKEND_ACTIVATE_TIMEOUT_MS, 0
+					batch.current_weapon_id, batch.current_weapon_slot = held.weapon_id, held.weapon_slot
+					return advance_bookend(first)
+				end
+			end
+		end
+		if not reason and held and held.phase == "ready" then
+			batch.current_weapon_id, batch.current_weapon_slot = held.weapon_id, held.weapon_slot
+			local weapon = resolve_batch_weapon()
+			if not weapon then reason = "held-weapon-changed"
+			else
+				local ok
+				ok, plan = pcall(assignment.field_plan, weapon,
+					{ [held.magazine_id] = true }, held.preferred)
+				if not ok then reason, detail, plan = "planner_failed", plan, nil
+				elseif plan then
+					held.phase, held.loaded_started = "loading", true
+				else
+					local inserted, insert_detail, retry = reinsert_held()
+					if not inserted and retry then batch.next_at = core.now_ms() + 25 return "consumed" end
+					if not inserted then reason, detail = "held-reinsert-failed", insert_detail
+					elseif held.assignment_failed then reason, detail = "held-assignment-failed", insert_detail
+					else
+						batch.total = math.max(0, (batch.total or 1) - 1)
+						batch.current_weapon_id, batch.current_weapon_slot = nil, nil
+						log_info("held magazine had no remaining field-load plan; reinserted unchanged")
+					end
+				end
+			end
+		end
+		while not reason and not plan and batch.active and batch.groups and batch.group_index <= #batch.groups do
+			local group = batch.groups[batch.group_index]
+			batch.current_weapon_id, batch.current_weapon_slot = group.weapon_id, group.weapon_slot
+			local weapon = group.weapon_id and resolve_batch_weapon() or nil
+			if group.weapon_id and not weapon then reason = "weapon_changed" break end
+			local ok
+			ok, plan = pcall(assignment.field_plan, weapon, group.magazine_ids, group.preferred_ammo)
+			if not ok then reason, detail, plan = "planner_failed", plan, nil break end
+			if plan then break end
+			batch.group_index = batch.group_index + 1
+		end
+		reason = reason or (not plan and "complete" or nil)
+	end
+	local last_id = batch.last_id
+	if not plan then
+		if last_id then
+			batch.completed = (batch.completed or 0) + 1
+			batch.last_id, batch.current_id, batch.before_count = nil, nil, nil
+		end
+		if reason ~= "complete" then
+			log_error("field batch %s | %s | %s", first and "could not start" or "stopped",
+				tostring(reason), tostring(detail))
+		end
+		finish_batch(not first, reason) return "consumed"
+	end
+	local id = plan.magazine_id or object_id(plan.magazine)
+	if last_id and id == last_id then
+		local after = loaded_count(last_id)
+		if after == nil or after <= (batch.before_count or after) then
+			log_error("field batch made no progress | magazine_id=%s", tostring(last_id))
+			finish_batch(true, "stalled") return "consumed"
+		end
+	elseif last_id then
+		batch.completed = (batch.completed or 0) + 1
+	end
+	local before = id and loaded_count(id) or nil
+	if not (batch.active and not batch.cancelled and plan.magazine and id and before) then return "consumed" end
+	batch.last_id, batch.current_id, batch.before_count = nil, id, before
+	batch.running, batch.seen_active = true, false
+	batch.cancel_deadline, batch.query_interrupt_sent, cancel_latched = nil, nil, false
+	log_batch_started()
+	local result = host_mode == "legacy" and
+		(begin_legacy_session(plan, false, true) and "started" or "consumed") or claim_native(plan)
+	batch.seen_active = host_in_flight()
+	if result == "consumed" and not batch.seen_active then settle_batch_magazine(id) end
+	return result
+end
+function claim_field_load(weapon)
+	if core.get_setting("enabled", true) == false or not available() then return "pass" end
+	if batch.active or host_in_flight() or movement_blocks_loading() then return "consumed" end
+	if weapon then
+		local ok, readiness = pcall(core.readiness, weapon, object_id(weapon))
+		if not ok or readiness ~= "healthy" then return readiness == "grenade" and "pass" or "consumed" end
+	end
+	local ok, groups, total, held = pcall(assignment.field_snapshot, weapon)
+	if not ok then log_error("assignment field snapshot failed: %s", tostring(groups)) return "consumed" end
+	total = tonumber(total) or 0
+	local actor = db and db.actor
+	if not (actor and type(groups) == "table" and total > 0) then return "consumed" end
+	local slot_ok, slot = pcall(function() return actor:active_slot() end)
+	local active_item = slot_ok and slot and slot ~= 0 and actor:item_in_slot(slot) or nil
+	batch = { active = true, running = false, cancelled = false, groups = groups,
+		group_index = 1, total = total, completed = 0,
+		restore_slot = slot_ok and slot ~= 0 and slot or nil, restore_weapon_id = object_id(active_item),
+		held = type(held) == "table" and held or nil }
+	if batch.held then
+		local held_weapon_object = held_weapon(batch.held)
+		local count_ok, count = pcall(function() return held_weapon_object and held_weapon_object:get_ammo_in_magazine() end)
+		batch.held.phase, batch.held.pre_empty = "pre_activate", count_ok and count == 0 or false
+		batch.held.bookend_deadline, batch.held.next_activate = core.now_ms() + BOOKEND_ACTIVATE_TIMEOUT_MS, 0
+		batch.current_weapon_id, batch.current_weapon_slot = batch.held.weapon_id, batch.held.weapon_slot
+		log_batch_started()
+		local result = advance_bookend(true)
+		if result ~= "resume" then return result end
+	end
+	return advance_batch(true)
+end
+function on_actor_update()
+	local running = host_active()
+	local now = core.now_ms()
+	if not batch.active and not running then
+		if not driver_is_animating() then native_lock = nil end
+		if cancel_latched and not driver_is_animating() then cancel_latched = false
+		elseif not cancel_latched then movement_interrupt_sent = false end
+		return
+	end
+	if movement_blocks_loading() and not movement_interrupt_sent then
+		movement_interrupt_sent = true interrupt("movement") return
+	end
+	if host_mode == "native" and native_active_query_failed then
+		if not batch.active then return end
+		if not batch.query_interrupt_sent then
+			latch_batch_cancel()
+			batch.query_interrupt_sent = true
+			pcall(original.do_interrupt)
+			if driver_is_animating() then pcall(driver_interrupt) end
+		end
+		if not driver_is_animating() or now >= (batch.cancel_deadline or now) then
+			finish_batch(true, "native-query-failed")
+		end
+		return
+	end
+	if batch.active and batch.cancelled then
+		advance_cancelled_batch(running, now)
+		return
+	end
+	if not batch.active then return end
+	if batch.running then
+		if running then batch.seen_active = true return end
+		if driver_is_animating() then return end
+		native_lock = nil
+		settle_batch_magazine(batch.current_id, now) return
+	end
+	if now >= (batch.next_at or 0) then advance_batch(false) end
+end
+-- The Reload controller calls this only for a jump, sprint or accelerate bind.
+function on_movement_input(bind)
+	if not active() then return false end
+	movement_interrupt_sent = true interrupt("movement")
+	return true
+end
+function status()
+	if host_mode ~= "inactive" and not available() then return host_mode, "assignment service unavailable" end
+	return host_mode, inactive_reason
+end
+settle_pending_held_eject = function()
+	local held = batch.active and batch.held or nil
+	if not (held and (held.phase == "ejecting" or held.phase == "await_eject") and
+		held.ejected and held.magazine_id and held.eject_snapshot) then return false end
+	if core.data_for(held.magazine_id) then return true end
+	if type(RemoveTimeEvent) == "function" then
+		pcall(RemoveTimeEvent, "mag_redux", "timer_eject_" .. tostring(held.weapon_id))
+	end
+	local ok, err = pcall(magazines.timer_eject_magazine, held.weapon_id, held.magazine_id, copy_value(held.eject_snapshot))
+	if not ok then log_error("held-eject settlement failed | weapon_id=%s | %s", tostring(held.weapon_id), tostring(err)) end
+	return ok and core.data_for(held.magazine_id) ~= nil
+end
+local function hard_cancel(restore_slot)
+	local legacy_active = session.active
+	local slot = batch.restore_slot
+	if batch.active then latch_batch_cancel() end
+	if legacy_active then
+		local session_slot = reset_session(false)
+		slot = slot or session_slot
+		pcall(original.do_interrupt)
+	elseif host_mode == "native" and host_in_flight() then
+		pcall(magazines.do_interrupt)
+	end
+	if driver_is_animating() then
+		local ok, err = pcall(driver_interrupt)
+		if not ok then log_error("save/load driver cancel failed: %s", tostring(err)) end
+	end
+	if batch.active and settle_pending_held_eject() and not exact_object(batch.held.magazine_id) then
+		batch.held.phase = "done"
+		log_info("save/load preserved generated held magazine loose | weapon_id=%s | magazine_id=%s",
+			tostring(batch.held.weapon_id), tostring(batch.held.magazine_id))
+	end
+	if batch.active then finish_batch(restore_slot, "hard-cancelled", true)
+	elseif restore_slot then restore_weapon_slot(slot) end
+	native_lock = nil
+	if not driver_is_animating() then cancel_latched = false end
+	movement_interrupt_sent = false
+end
+function on_game_load() hard_cancel(false) end on_load_state = on_game_load
+-- Save-state serialization follows this callback, so settle or preserve the exact
+-- loose magazine before the assignment service serializes Mags binder data.
+function on_save_state() hard_cancel(true) end
+install_host()
+function on_game_start() install_host() end

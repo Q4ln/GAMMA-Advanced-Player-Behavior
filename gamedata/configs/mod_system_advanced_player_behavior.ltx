@@ -1,0 +1,8 @@
+; Advanced Player Behavior
+; Keep the native safemode/low-ready interpolation, but reduce the inherited
+; interpolation divisor from GAMMA's 0.30 default to 0.15. This is the engine
+; path used when ADS begins from a peacefully lowered weapon. Weapon sections
+; that define a later explicit override retain their own value.
+
+![default_weapon_params]
+weapon_lower_speed = 0.15

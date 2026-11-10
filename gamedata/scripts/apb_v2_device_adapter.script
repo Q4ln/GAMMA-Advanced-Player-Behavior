@@ -1,0 +1,180 @@
+-- Advanced Player Behavior v2: single-consumer device adapters.
+--
+-- Night vision (item_device, z_beefs_nvgs), the BAS laser (zzz_bas_laser_control)
+-- and Mark Switch (z_mark_switch) are consumed by apb_v2_contextual alone, so
+-- their seams live here rather than in the shared player adapter; each
+-- third-party API is named in exactly this one file.  Every function is
+-- fail-soft: a missing third-party module yields a harmless no-op (false or
+-- nil) instead of an error.  Weapon snapshots are values produced by
+-- apb_v2_player_adapter.active_weapon(); this file never depends on that
+-- namespace.  Device writes call core.invalidate_mutations() after a
+-- successful engine write so every frame memo and mutation-keyed cache
+-- rebuilds before the next read.
+
+local api = apb_v2_core
+
+-- The core helpers every probe uses, bound once by init(); the composition
+-- root initialises this adapter before any module runs.
+local call, method, yes, mutation_epoch, invalidate
+
+function init(core)
+	api = core or apb_v2_core
+	call = api.safe_call
+	method = api.safe_method
+	yes = api.truthy
+	mutation_epoch = api.mutation_epoch
+	invalidate = api.invalidate_mutations
+end
+
+
+local function section(object)
+	local value, ok = method(object, "section")
+	return ok and value or nil
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Night vision
+
+function nv_state()
+	local value, ok = call(item_device and item_device.is_nv_active)
+	return ok and yes(value, false) or false
+end
+
+
+function nv_device()
+	local player = api.actor(true)
+	if not player then return nil, nil, nil end
+	local item = method(player, "item_in_slot", 10)
+	return item, api.actor_id(item), section(item)
+end
+
+
+function toggle_nv(desired)
+	local _, _, device_section = nv_device()
+	if not (device_section and item_device) then return false end
+	local _, ok = call(item_device.set_nightvision, device_section, desired and true or false)
+	if ok then invalidate() end
+	return ok
+end
+
+
+function adjust_nv_brightness()
+	local _, ok = call(z_beefs_nvgs and z_beefs_nvgs.brightness_adjust)
+	return ok
+end
+
+
+-- ---------------------------------------------------------------------------
+-- BAS laser
+
+function bas()
+	return type(zzz_bas_laser_control) == "table" and zzz_bas_laser_control or nil
+end
+
+
+function bas_has_laser(section_name)
+	local module = bas()
+	local value, ok = call(module and module.has_laser, section_name)
+	return ok and yes(value, false) or false
+end
+
+
+-- BAS's get_weapon_cfg rebuilds a merged config (dup_table plus a parent-chain
+-- ini walk) on every call and caches nothing, so the per-section result is
+-- kept until the core's mutation epoch moves.  false marks a section
+-- BAS could not describe.
+local cfg_cache = {}
+local cfg_epoch = -1
+
+local function bas_config(module, section_name)
+	if section_name == nil then return nil end
+	local current = mutation_epoch()
+	if cfg_epoch ~= current then
+		cfg_epoch = current
+		cfg_cache = {}
+	end
+	local cfg = cfg_cache[section_name]
+	if cfg == nil then
+		local value, ok = call(module.get_weapon_cfg, section_name)
+		cfg = ok and type(value) == "table" and value or false
+		cfg_cache[section_name] = cfg
+	end
+	return cfg or nil
+end
+
+
+local function bas_permitted(section_name, cfg_key, opt_key)
+	local module = bas()
+	if not module then return false end
+	local cfg = bas_config(module, section_name)
+	if not cfg then return false end
+	local hidden = cfg[cfg_key]
+	if hidden == nil then hidden = module[opt_key] end
+	return not yes(hidden, false)
+end
+
+
+function bas_alt_permitted(section_name)
+	return bas_permitted(section_name, "no_laser_alt_aim", "opt_no_laser_alt_aim")
+end
+
+
+function bas_saved(id)
+	local module = bas()
+	return module and type(module.saved_lasers) == "table" and module.saved_lasers[id] == true or false
+end
+
+
+function bas_set_visible(on, section_name)
+	local module = bas()
+	local _, ok = call(module and module.set_laser, on and 1 or 0, section_name)
+	if ok then invalidate() end
+	return ok
+end
+
+
+function bas_restore_saved(snapshot)
+	if not (snapshot and snapshot.id and snapshot.section and bas_has_laser(snapshot.section)) then
+		return bas_set_visible(false)
+	end
+	local visible = bas_saved(snapshot.id)
+	if visible and snapshot.zoomed then
+		if snapshot.zoom_type == 1 and not bas_alt_permitted(snapshot.section) then visible = false end
+		if snapshot.zoom_type == 0 and
+			not bas_permitted(snapshot.section, "no_laser_primary_aim", "opt_no_laser_primary_aim") then visible = false end
+	end
+	return bas_set_visible(visible, snapshot.section)
+end
+
+
+function cycle_laser_hue(snapshot)
+	local module = bas()
+	if not (module and snapshot and snapshot.section) then return false end
+	local cfg, ok = call(module.get_weapon_cfg, snapshot.section)
+	if not (ok and type(cfg) == "table") then return false end
+	local hue = tonumber(cfg.hue) or 0
+	local next_hue = hue < 33 and 33 or (hue < 66 and 66 or 0)
+	local copy = {}
+	for key, value in pairs(cfg) do copy[key] = value end
+	copy.hue = next_hue
+	local _, set_ok = call(module.set_weapon_cfg, snapshot.section, copy)
+	if not set_ok then return false end
+	call(module.flush_user_cfg)
+	invalidate()
+	bas_set_visible(true, snapshot.section)
+	return true, next_hue
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Mark Switch
+
+function cycle_mark(snapshot)
+	if not (z_mark_switch and snapshot and snapshot.item) then return false end
+	local info, ok = call(z_mark_switch.parse_parameters, snapshot.item)
+	if not (ok and type(info) == "table" and (tonumber(info.ms_count) or 1) >= 2) then return false end
+	local _, applied = call(z_mark_switch.apply_next_mark, snapshot.item, info)
+	if applied then invalidate() end
+	return applied
+end

@@ -1,0 +1,308 @@
+-- Advanced Player Behavior v2 Suit Setups wheel, built on Haru ARM.
+-- The setup registry lives in apb_v2_suit_model.script and the switching
+-- transaction in apb_v2_suit_transaction.script; remember_outfit_belt.script
+-- is the facade that connects them, this wheel and the manager to the router.
+
+-- The facade binds this namespace at load time, so remember_outfit_belt is
+-- read at call time only; the shared row presentation is apb_v2_suit_ui.
+local ui = apb_v2_suit_ui
+local UI_ID = "UIAPBV2SuitWheel"
+local WHEEL_XML = "apb_v2_suit_wheel.xml"
+local OPTION_XML = "apb_v2_suit_wheel_option.xml"
+-- utils_ui grid unit for the suit icon cell, and the icon's lift above the
+-- slot centre in UI units: a 2x3 outfit and its name below it stay inside the
+-- ring's band in every one of the eight positions.
+local ICON_GRID = 22
+local ICON_OFFSET_Y = -9
+-- Inside this radius, in UI units of height, nothing is aimed: the wheel opens
+-- with the cursor at its centre, and a click there must not apply a setup.
+local DEAD_ZONE = 100
+local TITLE_COLOR = GetARGB(255, 240, 240, 240)
+
+local apply_callback
+local wake_callback
+local clock_callback = function() return time_global() end
+local pending_apply
+
+local option_xml
+
+-- Parsed on the first wheel open, not at load: Refresh runs only from open(),
+-- so a session that never opens the wheel reads no option XML.
+local function options_xml()
+	if not option_xml then
+		option_xml = CScriptXmlInit()
+		option_xml:ParseFile(OPTION_XML)
+	end
+	return option_xml
+end
+
+GUI = nil
+
+
+function configure(options)
+	apply_callback = options.apply
+	wake_callback = options.wake
+	clock_callback = options.now or clock_callback
+end
+
+
+local function slowmo_factor()
+	if ui_mcm.get("haru_quick_action_wheel_mcm/misc/slowmo") ~= true then
+		return nil
+	end
+	local value = tonumber(ui_mcm.get("haru_quick_action_wheel_mcm/misc/slowmo_factor"))
+	return value and clamp(value, 0.1, 1) or 0.5
+end
+
+
+-- The wheel is deliberately unavailable over every gameplay UI and during
+-- LAM2/FDDA item animations. Combat by itself is not a blocker.
+local function can_open()
+	local actor = db.actor
+
+	if not actor or not actor:alive() or remember_outfit_belt.is_busy() then
+		return false
+	end
+
+	if actor:is_talking() then
+		return false
+	end
+
+	if (not main_hud_shown()) or actor_menu.inventory_opened() or ActorMenu.get_pda_menu():IsShown() then
+		return false
+	end
+
+	if (_GUIs and not is_empty(_GUIs)) or not game.hud_motion_allowed() or game.only_movekeys_allowed() then
+		return false
+	end
+
+	if item_device and item_device.is_pda_active and item_device.is_pda_active() then
+		return false
+	end
+
+	if lam2 and lam2.is_running and lam2.is_running() then
+		return false
+	end
+
+	local active_item = actor:active_item()
+	if active_item and active_item:get_state() ~= 0 then
+		return false
+	end
+
+	return true
+end
+
+
+class "APBV2SuitWheelOption" (haru_arm.WheelOption)
+
+function APBV2SuitWheelOption:__init(xml, parent, slot, row)
+	super(xml, parent)
+	self.slot = slot
+	self.name = row.name
+	self.status = row.status
+	self.suit_section = row.suit_section
+	self.suit_object = row.suit_object
+	self.state = row.can_apply and haru_arm.States.ENABLED or haru_arm.States.DISABLED
+end
+
+-- Haru option overlays: widescreen-corrected and centred on the container.
+function APBV2SuitWheelOption:Overlay(path)
+	local element = self.xml:InitStatic(path, self.container)
+	haru_arm.scale_ui(element, true)
+	self:CenterElement(element)
+	element:Show(false)
+	return element
+end
+
+function APBV2SuitWheelOption:Draw(x, y)
+	haru_arm.WheelOption.Draw(self, x, y)
+
+	-- Haru's light halo is faint over a bright background, so it is drawn twice.
+	self.hover_bg = self:Overlay("hover_bg")
+	self.hover_glow = self:Overlay("hover_bg")
+	self.selected_bg = self:Overlay("selected_bg")
+	self.selected_bg:Show(self.status == remember_outfit_belt.STATUS_EQUIPPED)
+
+	-- Haru rebuilds the cell on every Draw, so it starts empty and there is
+	-- nothing to compare against; the manager, whose rows persist, keeps the
+	-- change guard. The presentation itself is shared.
+	self.icon = ui.new_suit_cell("apb_v2_suit_wheel_" .. self.slot, self, "cont_item", self.container, ICON_GRID)
+	self:CenterElement(self.icon.prof)
+	local pos = self.icon.prof:GetWndPos()
+	self.icon.prof:SetWndPos(vector2():set(pos.x, pos.y + ICON_OFFSET_Y))
+
+	if self.suit_section then
+		ui.show_suit(self.icon, self.suit_object, self.suit_section)
+		ui.hide_badges(self.icon)
+	end
+
+	self.label = self.xml:InitTextWnd(self.suit_section and "label" or "label_empty", self.container)
+	haru_arm.scale_ui(self.label, true)
+	self.label:SetText(self.name)
+	-- Ready names stay neutral; the others take their status colour, so the
+	-- ring shows what can be applied without aiming at each slot.
+	if self.suit_section and self.status ~= remember_outfit_belt.STATUS_READY then
+		self.label:SetTextColor(ui.STATUS_COLOR[self.status])
+	end
+end
+
+function APBV2SuitWheelOption:OnClick()
+	-- Finish Haru's input callback before starting LAM2 or moving equipment.
+	pending_apply = {slot = self.slot, due_at = clock_callback() + 10}
+	self.parent:Close()
+	if wake_callback then pcall(wake_callback, 0) end
+end
+
+
+class "APBV2SuitWheel" (haru_arm.UIAdvancedRadialMenu)
+
+function APBV2SuitWheel:__init(xml, open_key) super(xml)
+	self.open_key = open_key
+	self.slowmo = false
+	self.title = self.xml:InitTextWnd("title", self.bg)
+	haru_arm.scale_ui(self.title, true)
+end
+
+function APBV2SuitWheel:SetTitle(text, color)
+	self.title:SetText(text)
+	if color then self.title:SetTextColor(color) end
+	self.title:AdjustHeightToText()
+end
+
+function APBV2SuitWheel:Refresh()
+	self:Reset()
+	self.titled_idx = 0
+	self:SetTitle(game.translate_string("ui_apb_v2_suit_wheel_title"))
+
+	local xml = options_xml()
+	local view = remember_outfit_belt.get_slots_view()
+	for slot = 1, remember_outfit_belt.SLOT_COUNT do
+		self:AddOption(APBV2SuitWheelOption(xml, self, slot, view.slots[slot]))
+	end
+
+	self:DrawOptions()
+end
+
+local function show_hover(option, shown)
+	option.hover_bg:Show(shown)
+	if option.hover_glow then option.hover_glow:Show(shown) end
+end
+
+-- The aimed option gets the halo and the centre title, clickable or not.
+-- Haru's base aims the nearest option from any cursor position, so inside the
+-- dead zone the aim is taken back: a click there finds no option.
+function APBV2SuitWheel:UpdateCallback()
+	local cursor = GetCursorPosition()
+	local x_scale = (device().height / device().width) / (768 / 1024)
+	local dx = (cursor.x - self.center.x) / x_scale
+	local dy = cursor.y - self.center.y
+	if self.hovered_idx ~= 0 and dx * dx + dy * dy < DEAD_ZONE * DEAD_ZONE then
+		local aimed = self.options[self.hovered_idx]
+		if aimed and aimed:IsState(haru_arm.States.TOUCHED) then
+			aimed:SetState(haru_arm.States.ENABLED)
+		end
+		self.hovered_idx = 0
+	end
+
+	if self.hovered_idx == self.titled_idx then return end
+	local previous = self.options[self.titled_idx]
+	if previous then show_hover(previous, false) end
+	self.titled_idx = self.hovered_idx
+	local option = self.options[self.hovered_idx]
+	if option then
+		show_hover(option, true)
+		self:SetTitle(option.name .. "\\n" .. ui.status_text(option.status), ui.STATUS_COLOR[option.status])
+	else
+		self:SetTitle(game.translate_string("ui_apb_v2_suit_wheel_title"), TITLE_COLOR)
+	end
+end
+
+function APBV2SuitWheel:OnKeyboardCallback(dik, keyboard_action)
+	return keyboard_action == ui_events.WINDOW_KEY_PRESSED and dik == self.open_key
+end
+
+function APBV2SuitWheel:Close()
+	if self.closing then
+		return
+	end
+	self.closing = true
+
+	if self.slowmo then
+		pcall(exec_console_cmd, "time_factor 1")
+		self.slowmo = false
+	end
+	self:HideDialog()
+
+	Unregister_UI(UI_ID)
+	if GUI == self then GUI = nil end
+end
+
+
+function open(open_key)
+	if not can_open() then
+		return false
+	end
+
+	if not GUI then
+		GUI = APBV2SuitWheel(WHEEL_XML, open_key)
+	end
+
+	if GUI:IsShown() then
+		return false
+	end
+
+	local factor = slowmo_factor()
+	GUI.open_key = open_key
+	GUI.closing = false
+	GUI:Refresh()
+	GUI:ShowDialog(true)
+
+	if factor then
+		GUI.slowmo = true
+		pcall(exec_console_cmd, "time_factor " .. factor)
+	end
+
+	_GUIs_keyfree[UI_ID] = true
+	Register_UI(UI_ID, script_name())
+	return true
+end
+
+
+function close()
+	if GUI and GUI:IsShown() then
+		GUI:Close()
+	end
+end
+
+
+function is_open()
+	return GUI and GUI:IsShown() or false
+end
+
+
+function reset()
+	close()
+	pending_apply = nil
+	GUI = nil
+end
+
+
+-- The shared APB update dispatcher calls this only while the wheel or its
+-- ten-millisecond click deferral is active.
+function on_update(now, hardware_down, hardware_known)
+	-- The engine can hide the wheel without calling Close (Esc while paused, a
+	-- forced conversation); Close still has to restore time and the key lock.
+	if GUI and not GUI.closing and not GUI:IsShown() then
+		GUI:Close()
+	elseif GUI and GUI:IsShown() and hardware_known and not hardware_down then
+		close()
+	end
+	if pending_apply and now >= pending_apply.due_at then
+		local slot = pending_apply.slot
+		pending_apply = nil
+		if apply_callback then apply_callback(slot) end
+	end
+	if GUI and GUI:IsShown() then return 0 end
+	if pending_apply then return math.max(0, pending_apply.due_at - now) end
+	return nil
+end

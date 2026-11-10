@@ -1,0 +1,204 @@
+-- Advanced Player Behavior v2: smart visor wiping with observed completion.
+-- Arming and cooldown are session-only and never saved; GAMMA owns wetness persistence.
+
+local api = apb_v2_core
+local player = apb_v2_player_adapter
+local ID = "visor"
+
+local enabled = false
+local armed = true
+local pending = false
+local last_mask = nil
+local cooldown_until = 0
+local phase = nil
+local animation_running = false
+local retry_after = 0
+
+
+local function log_info(fmt, ...) api.log_info("VISOR", fmt, ...) end
+
+
+local function wake() api.wake(ID, 0) end
+
+
+-- Every track arrives clamped, and the trigger and re-arm percentages
+-- cross-normalised, by core refresh_settings.
+local function interval_ms()
+	return api.get_setting("v2_smart_visor_wiping/min_interval_seconds") * 1000
+end
+
+
+function reset(reason)
+	armed = true
+	pending = false
+	last_mask = nil
+	cooldown_until = 0
+	phase = nil
+	animation_running = false
+	retry_after = 0
+end
+
+
+-- Shared action-down registry first; when no press edge was observed, poll the
+-- bound DIK directly so a key held since before the module woke still blocks.
+local function action_held(action)
+	return api.bind_down(action) or api.confirmed_down(api.action_dik(action))
+end
+
+
+local function safe_to_request(snapshot)
+	if not player.mask_on() or player.mask_wipe_running() or api.flag("contextual_gesture") then return false end
+	if action_held(key_bindings.kWPN_ZOOM) or action_held(key_bindings.kWPN_FIRE) then return false end
+	if snapshot.zoomed or (snapshot.is_weapon and snapshot.state ~= 0) then return false end
+	-- No snapshot: the adapter resolves the quick-melee slot from its own
+	-- per-epoch slot memo, which building this frame's snapshot already warmed,
+	-- so this is the same verdict stance asks for and the two share one
+	-- evaluation on a frame where both modules are awake.
+	if player.presentation_blocked(nil, true) then return false end -- Sprint intentionally allowed.
+	local allowed, ok = api.safe_call(actor_effects.allow_animation)
+	return ok and api.truthy(allowed, false) or false
+end
+
+
+local function start_observed_phase(current, wet)
+	local automatic = phase and phase.kind == "requested" or false
+	phase = {
+		kind = "running",
+		automatic = automatic,
+		started_at = current,
+		start_wet = wet,
+		reset_seen = false,
+	}
+	log_info("Wipe animation observed | source=%s", automatic and "automatic" or "manual")
+end
+
+
+local function observe_reset(current, wet)
+	if not phase or phase.kind ~= "running" or phase.reset_seen then return end
+	if wet < phase.start_wet - 0.02 or (wet <= 0.01 and current - phase.started_at >= 100) then
+		local cooldown = interval_ms()
+		phase.reset_seen = true
+		pending = false
+		armed = false
+		cooldown_until = current + cooldown
+		log_info("Droplet reset observed | cooldown_ms=%d", cooldown)
+	end
+end
+
+
+function init(core)
+	api = core or apb_v2_core
+	api.track_bind(key_bindings.kWPN_ZOOM)
+	api.track_bind(key_bindings.kWPN_FIRE)
+end
+
+
+function on_option_change()
+	local wanted = api.get_setting("v2_smart_visor_wiping/enabled")
+	api.set_active(ID, wanted)
+	if wanted == enabled then return end
+	enabled = wanted
+	reset(wanted and "enabled" or "disabled")
+	if not wanted then api.sleep(ID) end
+end
+
+
+-- Aim and Fire edges are recorded by the core registry; the module only needs
+-- to re-evaluate.  Zoom-in release ends a magnifier switch.
+function observe_input(input_phase, dik, bind, dis, ...)
+	if not enabled or dis then return end
+	if bind ~= key_bindings.kCAM_ZOOM_IN or input_phase == "release" then wake() end
+end
+
+
+function on_update(current)
+	if not enabled then return nil end
+	if not player.actor(true) then
+		pending = false
+		phase = nil
+		animation_running = false
+		return 250
+	end
+	local mask = player.mask_on()
+	local wet = player.wetness()
+	local running = player.mask_wipe_running()
+	if not mask then
+		pending = false
+		phase = nil
+		armed = false
+		last_mask = false
+		animation_running = false
+		return 250
+	end
+	local rearm = api.get_setting("v2_smart_visor_wiping/rearm_percent") / 100
+	if last_mask == false then armed = wet <= rearm end
+	last_mask = true
+
+	if running and not animation_running then start_observed_phase(current, wet) end
+	if running then observe_reset(current, wet) end
+	if not running and animation_running and phase and phase.kind == "running" then
+		if not phase.reset_seen then
+			pending = phase.automatic or pending
+			armed = true
+			log_info("Wipe ended before droplet reset; request retained")
+		end
+		phase = nil
+	end
+	animation_running = running
+	if phase and phase.kind == "requested" and not running and current - phase.sent_at >= 200 then
+		phase = nil
+		pending = true
+		retry_after = current + 75
+	end
+	if running then return 75 end
+
+	if wet <= rearm then
+		armed = true
+		if not phase then pending = false end
+	elseif armed and wet >= api.get_setting("v2_smart_visor_wiping/trigger_percent") / 100 then
+		armed = false
+		pending = true
+	end
+	if not pending then return 250 end
+	if current < cooldown_until then return math.max(1, math.min(250, cooldown_until - current)) end
+	if current < retry_after then return math.max(1, retry_after - current) end
+	local snapshot = player.active_weapon()
+	if not safe_to_request(snapshot) then return 75 end
+	local _, called = api.safe_call(actor_effects.Hit_MaskCleaning)
+	if called then
+		-- The installed public API returns nil even when it accepts the request.
+		-- Only a later animation edge plus actual wetness reduction can commit it.
+		phase = { kind = "requested", sent_at = current }
+	end
+	return 75
+end
+
+
+-- load_complete is the only routed event; everything else is wake-only.
+function on_event(name, ...)
+	if not enabled or name ~= "load_complete" then return end
+	reset(name)
+	wake()
+end
+
+
+MODULE = {
+	id = ID,
+	priority = 200,
+	events = { "load_complete" },
+	resets = { "actor_on_before_death", "actor_on_net_destroy", "on_before_level_changing", "on_level_changing" },
+	wake_only = {
+		"actor_on_first_update", "actor_on_hud_animation_play", "actor_on_hud_animation_end",
+		"actor_item_to_slot", "actor_item_to_ruck", "actor_on_weapon_zoom_in",
+		"actor_on_weapon_zoom_out", "actor_on_attach_vehicle", "actor_on_detach_vehicle",
+	},
+	input = { observe = { "kWPN_ZOOM", "kWPN_FIRE", "kCAM_ZOOM_IN" } },
+	handlers = {
+		init = init,
+		option_change = on_option_change,
+		update = on_update,
+		event = on_event,
+		reset = reset,
+		observe = observe_input,
+	},
+}

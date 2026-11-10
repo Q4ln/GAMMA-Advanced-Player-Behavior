@@ -1,0 +1,896 @@
+-- Advanced Player Behavior v2: Suit Setups equipment transaction.
+--
+-- configure(deps) accepts { core, now, wake } from remember_outfit_belt.  The
+-- model, equipment and queue modules, LAM2 and the engine globals are read
+-- directly; every optional presentation provider is reached through the
+-- presentation partial.
+--
+-- This file owns the Service class, its constants, the phase machine, the
+-- shared action builders and the module facade.  The queued work itself lives
+-- in three partials that attach their methods to the same class at configure
+-- time: apb_v2_suit_transaction_forward, _rollback and _presentation.
+
+local core_api = nil
+
+local PHASE_WAITING_IDLE = "WAITING_IDLE"
+local PHASE_APPLYING = "APPLYING"
+local PHASE_VERIFYING = "VERIFYING"
+local PHASE_WAITING_ROLLBACK = "WAITING_ROLLBACK"
+local PHASE_ROLLING_BACK = "ROLLING_BACK"
+local PHASE_VERIFYING_ROLLBACK = "VERIFYING_ROLLBACK"
+
+local QUEUE_START_TIMEOUT_MS = 15000
+local QUEUE_STOP_TIMEOUT_MS = 15000
+local PROGRESS_TIMEOUT_MS = 20000
+local CHECKPOINT_TIMEOUT = 2.0
+local BELT_MOVE_TIMEOUT = 2.0
+
+local FORWARD = "forward"
+local ROLLBACK = "rollback"
+
+local EVENT_QUEUE_START = "queue_start"
+local EVENT_QUEUE_DONE = "queue_done"
+local EVENT_FINAL_VERIFY = "final_verify"
+local EVENT_ROLLBACK_WAIT = "rollback_wait"
+local EVENT_ROLLBACK_VERIFY = "rollback_verify"
+local EVENT_WATCHDOG = "watchdog"
+
+local Service = {}
+Service.__index = Service
+local default_service = nil
+
+local function inventory_open()
+	local gui = ui_inventory and ui_inventory.GUI or nil
+	if gui and gui.IsShown and gui:IsShown() then
+		return true
+	end
+	return actor_menu and actor_menu.inventory_opened and actor_menu.inventory_opened() or false
+end
+
+local function append_action(actions, action)
+	if action then
+		actions[#actions + 1] = action
+	end
+end
+
+-- Everything a partial is allowed to close over.  It is a private argument of
+-- install(), not a field of this module: the partials own no constants and the
+-- transaction publishes none.
+local PARTIAL_CONSTANTS = {
+	FORWARD = FORWARD,
+	ROLLBACK = ROLLBACK,
+	CHECKPOINT_TIMEOUT = CHECKPOINT_TIMEOUT,
+	BELT_MOVE_TIMEOUT = BELT_MOVE_TIMEOUT,
+	append_action = append_action,
+}
+
+-- Service.__index = Service and new_service uses setmetatable, so method
+-- lookup stays dynamic and installing before the first service exists is safe.
+-- A partial script that failed to load is a loud error at init instead of a nil
+-- call on the first Apply.
+local PARTIALS = {
+	"apb_v2_suit_transaction_forward",
+	"apb_v2_suit_transaction_rollback",
+	"apb_v2_suit_transaction_presentation",
+}
+
+local partials_installed = false
+
+local function install_partials()
+	if partials_installed then
+		return
+	end
+	partials_installed = true
+	for _, name in ipairs(PARTIALS) do
+		local partial = rawget(_G, name)
+		if type(partial) == "table" and type(partial.install) == "function" then
+			partial.install(Service, PARTIAL_CONSTANTS)
+		else
+			core_api.log_error("SUIT-SETUPS", "suit transaction partial %s did not install", name)
+		end
+	end
+end
+
+function new_service(deps)
+	deps = deps or {}
+	local self = setmetatable({}, Service)
+	self.model = apb_v2_suit_model
+	self.equipment = apb_v2_suit_equipment
+	self.queue_module = apb_v2_suit_queue
+	self.now = deps.now or time_global
+	self.wake = deps.wake
+	self.transaction = nil
+	self.headgear_blacklist = nil
+	self.fdda_config_cache = {}
+	return self
+end
+
+function configure(deps)
+	core_api = deps.core
+	install_partials()
+	default_service = new_service(deps)
+end
+
+function Service:actor()
+	return db and db.actor or nil
+end
+
+function Service:trace(message, ...)
+	core_api.log_info("SUIT-SETUPS", message, ...)
+end
+
+function Service:warn(message, ...)
+	core_api.log_error("SUIT-SETUPS", message, ...)
+end
+
+function Service:notify_id(id, seconds, ...)
+	local text = game and game.translate_string and game.translate_string(id) or id
+	if select("#", ...) > 0 then
+		local ok, formatted = pcall(string.format, text, ...)
+		text = ok and formatted or text
+	end
+	if actor_menu and actor_menu.set_msg then
+		actor_menu.set_msg(1, text, seconds or 4)
+	end
+end
+
+function Service:set_phase(tx, phase)
+	if self.transaction ~= tx then
+		return
+	end
+	tx.phase = phase
+	tx.queue:touch("phase " .. phase)
+	self:trace("slot %d phase %s", tx.index, phase)
+end
+
+function Service:is_busy()
+	return self.transaction ~= nil
+end
+
+function Service:on_update(now)
+	local tx = self.transaction
+	if not tx then return nil end
+	local delay = tx.queue:tick(now or self.now())
+	if self.transaction ~= tx then return nil end
+	return delay
+end
+
+function Service:slot_matches(slot, ref)
+	local actor = self:actor()
+	local obj = actor and actor:item_in_slot(slot) or nil
+	return self.equipment.object_matches_ref(obj, ref)
+end
+
+function Service:slot_state_matches(actor, slot, ref)
+	if ref then
+		return self:slot_matches(slot, ref)
+	end
+	return actor and not actor:item_in_slot(slot) or false
+end
+
+function Service:equipment_state_matches(actor, state)
+	return self:slot_state_matches(actor, 7, state.suit)
+		and self:slot_state_matches(actor, 12, state.helmet)
+		and self.equipment.belt_matches(state.belt)
+end
+
+function Service:belt_contains(ref)
+	for _, belt_ref in ipairs(self.equipment.capture_belt(self:actor())) do
+		if self.equipment.same_ref(belt_ref, ref) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Capacity and duplicate-category admission for one belt candidate on the
+-- given outfit; the current layout is read at call time.
+function Service:belt_admits(actor, outfit, ref)
+	return actor:belt_count() < self.equipment.outfit_capacity(outfit)
+		and self.equipment.belt_candidate_compatible(self.equipment.current_belt_layout(), ref)
+end
+
+function Service:clear_transaction(tx)
+	if self.transaction ~= tx then
+		return
+	end
+	tx.queue:close()
+	self.transaction = nil
+end
+
+-- Terminal sequence shared by every completion path: presentation cleanup,
+-- release the transaction, then the optional player notice.
+function Service:finalize(tx, message_id, seconds)
+	self:cleanup_headgear(tx)
+	self:clear_transaction(tx)
+	if message_id then
+		self:notify_id(message_id, seconds)
+	end
+end
+
+function Service:mark_fatal(tx, reason)
+	if self.transaction ~= tx or tx.fatal_reason then
+		return
+	end
+	tx.fatal_reason = tostring(reason or "equipment changed unexpectedly")
+	self:warn("slot %d fatal checkpoint: %s", tx.index, tx.fatal_reason)
+end
+
+function Service:mark_partial(tx, kind, reason)
+	if self.transaction ~= tx then
+		return
+	end
+	if kind == "helmet" then
+		tx.helmet_failed = true
+	elseif kind == "belt" then
+		tx.belt_failed = true
+	else
+		tx.animation_failed = true
+	end
+	self:trace("slot %d partial %s: %s", tx.index, tostring(kind), tostring(reason))
+end
+
+function Service:mark_rollback_issue(tx, reason)
+	if self.transaction ~= tx then
+		return
+	end
+	self:warn("slot %d rollback safeguard: %s", tx.index, tostring(reason))
+end
+
+function Service:new_queue_session(tx)
+	local service = self
+	return self.queue_module.new_session({
+		lam2 = lam2,
+		now = self.now,
+		wake = self.wake,
+		is_mode_valid = function(mode)
+			if service.transaction ~= tx then
+				return false
+			end
+			return mode == FORWARD and tx.phase == PHASE_APPLYING
+				or mode == ROLLBACK and tx.phase == PHASE_ROLLING_BACK
+		end,
+		on_action_error = function(mode, name, err)
+			local reason = tostring(name) .. " raised " .. tostring(err)
+			if mode == ROLLBACK then
+				service:mark_rollback_issue(tx, reason)
+			else
+				service:mark_fatal(tx, reason)
+			end
+		end,
+		on_native_error = function(label, stage, err)
+			service:mark_partial(tx, "animation", tostring(label) .. " " .. tostring(stage) .. " failed: " .. tostring(err))
+		end,
+		on_event_error = function(name, err)
+			service:handle_event_error(tx, name, err)
+		end,
+	})
+end
+
+-- Unsubscribe and rotate the action token in one place.  The adapter proves
+-- ownership before an abort; a true return means a foreign/mixed queue is
+-- still live and no synchronous equipment restoration may be attempted.
+function Service:invalidate_live_queue(tx)
+	tx.queue:unsubscribe()
+	tx.queue:abort_if_exclusive()
+	tx.queue:invalidate_actions()
+	return tx.queue:is_running()
+end
+
+-- Time events are the state machine's clock.  If that engine service fails,
+-- recovery must not depend on scheduling another event that can fail in the
+-- same way.  Forward work gets one normal rollback attempt; any nested failure
+-- or failure already inside rollback takes the guarded synchronous terminal
+-- path below.
+function Service:finish_event_failure(tx, reason)
+	if self.transaction ~= tx or tx.event_failure_terminal then
+		return
+	end
+	tx.event_failure_terminal = true
+	local foreign_queue_running = self:invalidate_live_queue(tx)
+
+	local restore_needed = tx.mutated and self:actor() ~= nil
+	local restore_attempted = restore_needed and not foreign_queue_running
+	local restored = not restore_attempted
+	if restore_attempted then
+		local ok, result = pcall(self.restore_previous_immediate, self, tx)
+		restored = ok and result == true
+		if not ok then
+			self:warn("slot %d timer-failure restore raised: %s", tx.index, tostring(result))
+		end
+	end
+
+	local slot_index = tx.index
+	self:finalize(tx)
+	self:warn("slot %d transaction terminated after time-event failure: %s", slot_index, tostring(reason))
+	if restore_needed and foreign_queue_running then
+		self:notify_id("ui_apb_v2_suit_timer_foreign", 7)
+	elseif restore_attempted and restored then
+		self:notify_id("ui_apb_v2_suit_timer_restored", 7)
+	elseif restore_attempted then
+		self:notify_id("ui_apb_v2_suit_timer_incomplete", 7)
+	else
+		self:notify_id("ui_apb_v2_suit_timer_stopped", 6)
+	end
+end
+
+function Service:handle_event_error(tx, name, err)
+	if self.transaction ~= tx then
+		return
+	end
+	local reason = "time event " .. tostring(name) .. " failed: " .. tostring(err)
+	local phase = tx.phase
+	self:warn("slot %d %s", tx.index, reason)
+
+	if phase == PHASE_WAITING_IDLE then
+		tx.queue:invalidate_actions()
+		self:finalize(tx, "ui_apb_v2_suit_timer_start_failed", 6)
+		return
+	end
+
+	if phase == PHASE_APPLYING or phase == PHASE_VERIFYING then
+		self:mark_fatal(tx, reason)
+		if tx.event_error_handling then
+			self:finish_event_failure(tx, reason)
+			return
+		end
+		tx.event_error_handling = true
+		local ok, rollback_err = pcall(self.begin_rollback, self, tx, reason)
+		if self.transaction == tx then
+			tx.event_error_handling = false
+		end
+		if not ok and self.transaction == tx then
+			self:finish_event_failure(tx, reason .. "; rollback raised: " .. tostring(rollback_err))
+		end
+		return
+	end
+
+	self:finish_event_failure(tx, reason)
+end
+
+-- A built action goes into `list` when the caller injects a sequence later,
+-- otherwise onto the live queue.
+local function place(tx, action, list)
+	if list then
+		append_action(list, action)
+	else
+		tx.queue:enqueue(action)
+	end
+	return action
+end
+
+function Service:enqueue_direct(tx, name, operation, mode, list)
+	mode = mode or FORWARD
+	local service = self
+	local kind = mode == ROLLBACK and "rollback action" or "action"
+	local wrapped = function()
+		service:trace("slot %d %s %s", tx.index, kind, name)
+		operation()
+	end
+	return place(tx, tx.queue:direct(name, wrapped, mode), list)
+end
+
+function Service:enqueue_checkpoint(tx, name, predicate, timeout, timeout_handler, mode, list)
+	mode = mode or FORWARD
+	local service = self
+	local kind = mode == ROLLBACK and "rollback checkpoint" or "checkpoint"
+	local reported = false
+	local wrapped = function()
+		if mode == FORWARD and tx.fatal_reason then
+			return true
+		end
+		local complete = predicate()
+		if complete and not reported then
+			reported = true
+			service:trace("slot %d %s %s passed", tx.index, kind, name)
+		end
+		return complete
+	end
+	return place(tx, tx.queue:checkpoint(name, wrapped, timeout or CHECKPOINT_TIMEOUT, timeout_handler, mode), list)
+end
+
+-- A settled belt move plays its item sound once; `report` turns a missing
+-- sound into an animation partial.
+function Service:play_settled_belt_sound(tx, state, ref, report)
+	if state.sound_played then
+		return
+	end
+	state.sound_played = true
+	if not self:play_belt_item_sound(self.equipment.resolve_belt_ref(ref, self:actor())) and report then
+		self:mark_partial(tx, "animation", "belt item sound was unavailable")
+	end
+end
+
+-- Move one belt item to the ruck, wait until it has left the belt, and play
+-- its item sound once inside that settle checkpoint.  `allowed` is the pure
+-- per-site guard (forward: no fatal; rollback: suit restoration still
+-- allowed) consulted by both actions; `require_target_suit` adds the forward
+-- preclear's fatal target-suit check to the move.
+function Service:enqueue_belt_move_out(tx, ref, base, mode, allowed, require_target_suit, timeout_handler, list)
+	local state = {moved = false, sound_played = false}
+	self:enqueue_direct(tx, base .. "_move", function()
+		if not allowed() or not self:belt_contains(ref) then
+			return
+		end
+		if require_target_suit and not self.equipment.resolve_ref(tx.setup.suit, IsOutfit, self:actor()) then
+			self:mark_fatal(tx, "target suit vanished before belt preclear")
+			return
+		end
+		local item = self.equipment.resolve_belt_ref(ref, self:actor())
+		if item then
+			tx.mutated = true
+			state.moved = true
+			self:actor():move_to_ruck(item)
+		end
+	end, mode, list)
+	self:enqueue_checkpoint(tx, base .. "_checkpoint", function()
+		if not allowed() then
+			return true
+		end
+		if self:belt_contains(ref) then
+			return false
+		end
+		if state.moved then
+			self:play_settled_belt_sound(tx, state, ref, true)
+		end
+		return true
+	end, BELT_MOVE_TIMEOUT, timeout_handler, mode, list)
+end
+
+function Service:defer_rollback_verification(tx, delay)
+	local service = self
+	tx.queue:schedule(EVENT_ROLLBACK_VERIFY, delay, function()
+		service:verify_rollback(tx)
+	end)
+end
+
+function Service:arm_watchdog(tx)
+	local service = self
+	tx.queue:schedule(EVENT_WATCHDOG, 0.25, function()
+		if service.transaction ~= tx then
+			return true
+		end
+		if tx.phase ~= PHASE_APPLYING and tx.phase ~= PHASE_ROLLING_BACK then
+			return true
+		end
+		if not tx.queue:is_stalled(PROGRESS_TIMEOUT_MS) then
+			return false
+		end
+
+		local _, label = tx.queue:get_progress()
+		if tx.phase == PHASE_APPLYING then
+			service:warn("slot %d forward queue stalled after %s", tx.index, tostring(label))
+			service:begin_rollback(tx, "equipment queue made no progress for 20 seconds")
+			return true
+		end
+
+		-- A rollback stall must not leave old actions armed.  Abort only if the
+		-- live queue is provably ours; mixed queues are allowed to drain while
+		-- their now-invalid GSS actions become no-ops.
+		service:warn("slot %d rollback queue stalled after %s", tx.index, tostring(label))
+		local foreign_queue_running = service:invalidate_live_queue(tx)
+		service:mark_rollback_issue(tx, "rollback queue made no progress for 20 seconds")
+		if foreign_queue_running then
+			service:finalize(tx, "ui_apb_v2_suit_rollback_blocked", 7)
+			return true
+		end
+		local ok, err = pcall(service.restore_previous_immediate, service, tx)
+		if not ok then
+			service:mark_rollback_issue(tx, "guarded rollback fallback failed: " .. tostring(err))
+		end
+		service:set_phase(tx, PHASE_VERIFYING_ROLLBACK)
+		tx.rollback_fill_pending = false
+		service:defer_rollback_verification(tx, 0.25)
+		return true
+	end)
+end
+
+function Service:verify_rollback(tx)
+	if self.transaction ~= tx then
+		return
+	end
+	local actor = self:actor()
+	if not (tx.before and actor) then
+		self:finalize(tx)
+		return
+	end
+	if tx.rollback_fill_pending then
+		tx.rollback_fill_pending = false
+		pcall(self.restore_previous_immediate, self, tx)
+		self:defer_rollback_verification(tx, 0.25)
+		return
+	end
+
+	local complete = self:equipment_state_matches(actor, tx.before)
+	self:trace("slot %d rollback %s", tx.index, complete and "complete" or "incomplete")
+	self:finalize(tx, complete and "ui_apb_v2_suit_failed_restored" or "ui_apb_v2_suit_failed_incomplete", complete and 6 or 7)
+end
+
+-- Polls every 50 ms while tx stays in `phase`: on_idle once the shared LAM2
+-- queue is idle, on_timeout once it has kept running for QUEUE_STOP_TIMEOUT_MS
+-- since tx.wait_started_at.  Both run inside the timer callback, so a timer
+-- either one schedules owns the slot afterwards.
+function Service:poll_queue_idle(tx, event, phase, on_idle, on_timeout)
+	local service = self
+	tx.queue:schedule(event, 0.05, function()
+		if service.transaction ~= tx or tx.phase ~= phase then
+			return true
+		end
+		if not tx.queue:is_running() then
+			on_idle()
+		elseif service.now() - tx.wait_started_at >= QUEUE_STOP_TIMEOUT_MS then
+			on_timeout()
+		else
+			return false
+		end
+		return true
+	end)
+end
+
+function Service:enter_queue_stopped(tx, phase)
+	tx.queue:unsubscribe()
+	tx.queue:remove_event(EVENT_WATCHDOG)
+	tx.wait_started_at = self.now()
+	self:set_phase(tx, phase)
+end
+
+function Service:on_rollback_queue_stop(tx)
+	if self.transaction ~= tx or tx.phase ~= PHASE_ROLLING_BACK then
+		return
+	end
+	self:enter_queue_stopped(tx, PHASE_VERIFYING_ROLLBACK)
+	local service = self
+	self:poll_queue_idle(tx, EVENT_ROLLBACK_WAIT, PHASE_VERIFYING_ROLLBACK, function()
+		service:trace("slot %d rollback queue stopped (sentinel=%s)", tx.index, tostring(tx.rollback_queue_complete))
+		if not tx.rollback_queue_complete then
+			service:mark_rollback_issue(tx, "rollback queue was interrupted")
+			tx.rollback_fill_pending = true
+			pcall(service.restore_previous_immediate, service, tx)
+		end
+		service:defer_rollback_verification(tx, tx.rollback_fill_pending and 0.25 or 0.15)
+	end, function()
+		service:mark_rollback_issue(tx, "another animation kept running after rollback; verifying without queue idleness")
+		tx.rollback_fill_pending = false
+		service:verify_rollback(tx)
+	end)
+end
+
+function Service:schedule_rollback_wait(tx)
+	local service = self
+	self:poll_queue_idle(tx, EVENT_ROLLBACK_WAIT, PHASE_WAITING_ROLLBACK, function()
+		service:finish_rollback(tx)
+	end, function()
+		service:warn("slot %d rollback could not enter the shared LAM2 queue", tx.index)
+		service:finalize(tx, "ui_apb_v2_suit_failed_foreign", 7)
+	end)
+end
+
+-- Callers reach this only after observing an idle LAM2 queue in the same Lua
+-- call stack (lam2 reports b_is_running synchronously), so no re-poll of
+-- is_running is needed before the rollback queue is built.
+function Service:finish_rollback(tx)
+	if self.transaction ~= tx or tx.phase ~= PHASE_WAITING_ROLLBACK then
+		return
+	end
+	self:cleanup_headgear(tx)
+	local actor = self:actor()
+	if not (actor and actor:alive()) then
+		self:clear_transaction(tx)
+		return
+	end
+	if not tx.mutated or not tx.before then
+		self:clear_transaction(tx)
+		self:notify_id("ui_apb_v2_suit_failed_unchanged", 5)
+		return
+	end
+
+	tx.rollback_snapshot = self.equipment.capture_current_equipment(actor)
+	tx.rollback_queue_complete = false
+	tx.queue:begin_queue(ROLLBACK)
+	self:set_phase(tx, PHASE_ROLLING_BACK)
+	local service = self
+	if not tx.queue:subscribe(function()
+		service:on_rollback_queue_stop(tx)
+	end) then
+		self:mark_rollback_issue(tx, "rollback queue subscription failed")
+		pcall(self.restore_previous_immediate, self, tx)
+		self:set_phase(tx, PHASE_VERIFYING_ROLLBACK)
+		self:defer_rollback_verification(tx, 0.25)
+		return
+	end
+
+	local ok, err = pcall(self.enqueue_rollback, self, tx)
+	if not ok then
+		self:mark_rollback_issue(tx, "rollback queue construction failed: " .. tostring(err))
+		local sentinel = tx.queue:direct("gss_rollback_error_sentinel", function()
+			tx.rollback_queue_complete = true
+		end, ROLLBACK)
+		local enqueue_ok, enqueue_err = pcall(tx.queue.enqueue, tx.queue, sentinel)
+		if not enqueue_ok then
+			self:mark_rollback_issue(tx, "rollback sentinel enqueue failed: " .. tostring(enqueue_err))
+			pcall(self.restore_previous_immediate, self, tx)
+			self:set_phase(tx, PHASE_VERIFYING_ROLLBACK)
+			self:defer_rollback_verification(tx, 0.25)
+			return
+		end
+	end
+	self:arm_watchdog(tx)
+end
+
+function Service:begin_rollback(tx, reason)
+	if self.transaction ~= tx then
+		return
+	end
+	if tx.phase == PHASE_WAITING_ROLLBACK or tx.phase == PHASE_ROLLING_BACK
+		or tx.phase == PHASE_VERIFYING_ROLLBACK
+	then
+		return
+	end
+	local actor = self:actor()
+	if not (actor and actor:alive()) then
+		self:finalize(tx)
+		return
+	end
+
+	local failure_reason = tostring(reason or tx.fatal_reason or "equipment changed unexpectedly")
+	tx.wait_started_at = self.now()
+	self:set_phase(tx, PHASE_WAITING_ROLLBACK)
+	self:warn("slot %d rollback started: %s", tx.index, failure_reason)
+	for _, event in ipairs({EVENT_QUEUE_START, EVENT_QUEUE_DONE, EVENT_FINAL_VERIFY, EVENT_WATCHDOG}) do
+		tx.queue:remove_event(event)
+	end
+
+	-- Inspect before invalidating the forward token.  Unknown/mixed queues are
+	-- never aborted; their GSS work is invalidated and allowed to drain.
+	if self:invalidate_live_queue(tx) then
+		self:schedule_rollback_wait(tx)
+		return
+	end
+	self:finish_rollback(tx)
+end
+
+function Service:finish_transaction(tx)
+	if self.transaction ~= tx then
+		return
+	end
+	self:cleanup_headgear(tx)
+	local actor = self:actor()
+	if not (actor and actor:alive()) then
+		self:clear_transaction(tx)
+		return
+	end
+	if tx.fatal_reason or not self:slot_matches(7, tx.setup.suit) then
+		self:begin_rollback(tx, tx.fatal_reason or "target suit was lost during final verification")
+		return
+	end
+
+	local missing, rejected = self:final_piece_counts(tx.setup)
+	local slot_index = tx.index
+	local helmet_failed = tx.helmet_failed
+	local belt_failed = tx.belt_failed
+	local animation_failed = tx.animation_failed
+	self:clear_transaction(tx)
+	if missing == 0 and rejected == 0 and not animation_failed then
+		self:trace("slot %d applied", slot_index)
+		self:notify_id("ui_apb_v2_suit_applied", 3)
+	else
+		self:trace("slot %d partial (%d unavailable, %d rejected; helmet=%s belt=%s animation=%s)",
+			slot_index, missing, rejected, tostring(helmet_failed), tostring(belt_failed), tostring(animation_failed))
+		if missing == 0 and rejected == 0 and animation_failed then
+			self:notify_id("ui_apb_v2_suit_applied_animation_partial", 5)
+		else
+			self:notify_id("ui_apb_v2_suit_applied_partial", 5, missing, rejected)
+		end
+	end
+end
+
+function Service:on_forward_queue_stop(tx)
+	if self.transaction ~= tx or tx.phase ~= PHASE_APPLYING then
+		return
+	end
+	self:enter_queue_stopped(tx, PHASE_VERIFYING)
+	local service = self
+	self:poll_queue_idle(tx, EVENT_QUEUE_DONE, PHASE_VERIFYING, function()
+		service:trace("slot %d LAM2 queue stopped (sentinel=%s)", tx.index, tostring(tx.queue_complete))
+		if not tx.queue_complete then
+			service:begin_rollback(tx, "equipment queue was interrupted")
+		elseif tx.fatal_reason then
+			service:begin_rollback(tx, tx.fatal_reason)
+		else
+			tx.queue:schedule(EVENT_FINAL_VERIFY, 0.15, function()
+				service:finish_transaction(tx)
+			end)
+		end
+	end, function()
+		if not tx.queue_complete or tx.fatal_reason then
+			service:warn("slot %d interrupted queue is still mixed with another animation; rollback will wait", tx.index)
+			service:begin_rollback(tx, tx.fatal_reason or "equipment queue was interrupted")
+		else
+			service:warn("slot %d final verification skipped because another animation did not stop", tx.index)
+			service:finalize(tx, "ui_apb_v2_suit_verify_blocked", 6)
+		end
+	end)
+end
+
+function Service:start_forward_queue(tx)
+	if self.transaction ~= tx or tx.phase ~= PHASE_WAITING_IDLE then
+		return
+	end
+	local actor = self:actor()
+	if not (actor and actor:alive()) then
+		self:clear_transaction(tx)
+		return
+	end
+	if not self.equipment.resolve_ref(tx.setup.suit, IsOutfit, actor) then
+		local index = tx.index
+		self:clear_transaction(tx)
+		self:trace("slot %d rejected before queue: exact suit not carried", index)
+		self:notify_id("ui_apb_v2_suit_exact_missing", 4)
+		return
+	end
+
+	tx.before = self.equipment.capture_current_equipment(actor)
+	tx.mutated = false
+	tx.fatal_reason = nil
+	tx.queue_complete = false
+	tx.helmet_failed = false
+	tx.belt_failed = false
+	tx.animation_failed = false
+	tx.queue:begin_queue(FORWARD)
+	self:set_phase(tx, PHASE_APPLYING)
+	self:trace("slot %d queue start (belt=%d, helmet=%s)", tx.index, #tx.setup.belt, tostring(tx.setup.helmet ~= nil))
+
+	local service = self
+	if not tx.queue:subscribe(function()
+		service:on_forward_queue_stop(tx)
+	end) then
+		self:mark_fatal(tx, "queue subscription failed")
+		self:begin_rollback(tx, tx.fatal_reason)
+		return
+	end
+	local ok, err = pcall(self.enqueue_forward, self, tx)
+	if not ok then
+		self:mark_fatal(tx, "queue construction failed: " .. tostring(err))
+		local sentinel = tx.queue:direct("gss_queue_error_sentinel", function()
+			tx.queue_complete = true
+		end, FORWARD)
+		local enqueue_ok, enqueue_err = pcall(tx.queue.enqueue, tx.queue, sentinel)
+		if not enqueue_ok then
+			self:begin_rollback(tx, "queue construction failed: " .. tostring(enqueue_err))
+			return
+		end
+	end
+	self:arm_watchdog(tx)
+end
+
+function Service:schedule_queue_start(tx)
+	local service = self
+	tx.queue:schedule(EVENT_QUEUE_START, 0.05, function()
+		if service.transaction ~= tx or tx.phase ~= PHASE_WAITING_IDLE then
+			return true
+		end
+		local actor = service:actor()
+		if not (actor and actor:alive()) then
+			service:clear_transaction(tx)
+			return true
+		end
+		if service.now() - tx.requested_at >= QUEUE_START_TIMEOUT_MS then
+			local index = tx.index
+			service:clear_transaction(tx)
+			service:warn("slot %d queue start timed out", index)
+			service:notify_id("ui_apb_v2_suit_start_blocked", 5)
+			return true
+		end
+		if tx.queue:is_running() or inventory_open() then
+			tx.idle_checks = 0
+			return false
+		end
+		tx.idle_checks = (tx.idle_checks or 0) + 1
+		if tx.idle_checks < 2 then
+			return false
+		end
+		service:start_forward_queue(tx)
+		return true
+	end)
+end
+
+function Service:apply(index)
+	self:trace("apply request slot %s", tostring(index))
+	if self:is_busy() then
+		self:notify_id("ui_apb_v2_suit_busy", 4)
+		self:trace("apply request rejected: busy")
+		return false, "busy"
+	end
+
+	local actor = self:actor()
+	if not (actor and actor:alive()) then
+		self:trace("apply request rejected: actor unavailable")
+		return false, "no_actor"
+	end
+	local capabilities = self.queue_module.detect_capabilities(lam2)
+	if not capabilities.ready then
+		self:notify_id("ui_apb_v2_suit_lam2_missing", 5)
+		self:warn("apply request rejected: LAM2 API unavailable (%s)", table.concat(capabilities.missing, ", "))
+		return false, "no_lam2"
+	end
+
+	-- get_slot rejects an invalid index and returns a fresh sanitised copy,
+	-- which the transaction keeps as its setup.
+	local setup = self.model.get_slot(index)
+	if not setup then
+		self:notify_id("ui_apb_v2_suit_empty", 4)
+		self:trace("apply request rejected: empty slot")
+		return false, "empty"
+	end
+	local status = self.equipment.evaluate_status(setup, self.equipment.capture_actor_snapshot({setup}), self.model)
+	if status == self.model.STATUS_UNAVAILABLE then
+		self:notify_id("ui_apb_v2_suit_exact_missing", 4)
+		self:trace("apply request rejected: exact suit unavailable")
+		return false, "suit_unavailable"
+	elseif status == self.model.STATUS_EQUIPPED then
+		self:notify_id("ui_apb_v2_suit_already_equipped", 3)
+		self:trace("apply request rejected: already equipped")
+		return false, "equipped"
+	end
+
+	if not self.equipment.resolve_ref(setup.suit, IsOutfit, actor) then
+		self:notify_id("ui_apb_v2_suit_exact_missing", 4)
+		self:trace("apply request rejected during exact-suit preflight")
+		return false, "suit_unavailable"
+	end
+
+	local tx = {
+		index = index,
+		setup = setup,
+		mutated = false,
+		requested_at = self.now(),
+		idle_checks = 0,
+		phase = PHASE_WAITING_IDLE,
+	}
+	self.fdda_config_cache = {}
+	tx.queue = self:new_queue_session(tx)
+	self.transaction = tx
+	self:set_phase(tx, PHASE_WAITING_IDLE)
+	self:trace("slot %d accepted; waiting for a clean LAM2 queue", index)
+	self:schedule_queue_start(tx)
+	return true
+end
+
+function Service:cancel(restore_previous, reason)
+	local tx = self.transaction
+	if not tx then
+		return false
+	end
+	self:trace("slot %d transaction cancelled by %s", tx.index, tostring(reason or "transition"))
+	local foreign_queue_running = self:invalidate_live_queue(tx)
+	if restore_previous and not foreign_queue_running and tx.mutated and self:actor() then
+		local ok, err = pcall(self.restore_previous_immediate, self, tx)
+		if not ok then
+			self:warn("transition rollback failed: %s", tostring(err))
+		end
+	elseif restore_previous and foreign_queue_running and tx.mutated then
+		self:warn("transition restore skipped because another animation queue is still running")
+	end
+	self:finalize(tx)
+	return true
+end
+
+-- Singleton facade API; remember_outfit_belt configures once at init.
+function apply(index)
+	if not default_service then
+		return false, "not_configured"
+	end
+	return default_service:apply(index)
+end
+
+function is_busy()
+	return default_service and default_service:is_busy() or false
+end
+
+function on_update(now)
+	return default_service and default_service:on_update(now) or nil
+end
+
+function cancel(restore_previous, reason)
+	return default_service and default_service:cancel(restore_previous, reason) or false
+end

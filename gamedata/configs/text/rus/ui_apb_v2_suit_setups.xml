@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+	<string id="ui_apb_v2_suit_menu"><text>Комплекты костюма...</text></string>
+	<string id="ui_apb_v2_suit_title"><text>Комплекты костюма</text></string>
+	<string id="ui_apb_v2_suit_wheel_title"><text>Комплекты костюма</text></string>
+	<string id="ui_apb_v2_suit_save"><text>Сохранить</text></string>
+	<string id="ui_apb_v2_suit_apply"><text>Применить</text></string>
+	<string id="ui_apb_v2_suit_delete"><text>Удалить</text></string>
+	<string id="ui_apb_v2_suit_close"><text>Закрыть</text></string>
+	<string id="ui_apb_v2_suit_name"><text>Имя (не более 10 символов)</text></string>
+	<string id="ui_apb_v2_suit_accept"><text>ОК</text></string>
+	<string id="ui_apb_v2_suit_cancel"><text>Отмена</text></string>
+	<string id="ui_apb_v2_suit_confirm_overwrite"><text>Перезаписать комплект «%s»?</text></string>
+	<string id="ui_apb_v2_suit_confirm_delete"><text>Удалить комплект «%s»?</text></string>
+	<string id="ui_apb_v2_suit_operation_failed"><text>Не удалось изменить комплект.</text></string>
+
+	<string id="ui_apb_v2_suit_status_empty"><text>Пусто</text></string>
+	<string id="ui_apb_v2_suit_status_equipped"><text>Надет</text></string>
+	<string id="ui_apb_v2_suit_status_unavailable"><text>Недоступен</text></string>
+	<string id="ui_apb_v2_suit_status_partial"><text>Неполный</text></string>
+	<string id="ui_apb_v2_suit_status_ready"><text>Готов</text></string>
+
+	<string id="ui_apb_v2_suit_timer_foreign"><text>Не удалось применить комплект: планировщик остановился, а другая анимация помешала безопасному восстановлению.</text></string>
+	<string id="ui_apb_v2_suit_timer_restored"><text>Не удалось применить комплект: планировщик остановился; прежнее снаряжение восстановлено.</text></string>
+	<string id="ui_apb_v2_suit_timer_incomplete"><text>Не удалось применить комплект: планировщик остановился; безопасное восстановление выполнено не полностью.</text></string>
+	<string id="ui_apb_v2_suit_timer_stopped"><text>Применение комплекта остановлено из-за сбоя планировщика.</text></string>
+	<string id="ui_apb_v2_suit_timer_start_failed"><text>Не удалось начать применение комплекта из-за сбоя планировщика.</text></string>
+	<string id="ui_apb_v2_suit_rollback_blocked"><text>Откат комплекта остановлен: другая анимация помешала безопасному восстановлению.</text></string>
+	<string id="ui_apb_v2_suit_failed_restored"><text>Не удалось применить комплект; прежнее снаряжение восстановлено.</text></string>
+	<string id="ui_apb_v2_suit_failed_incomplete"><text>Не удалось применить комплект; откат выполнен не полностью.</text></string>
+	<string id="ui_apb_v2_suit_failed_foreign"><text>Не удалось применить комплект; другая анимация помешала полному откату.</text></string>
+	<string id="ui_apb_v2_suit_failed_unchanged"><text>Не удалось применить комплект; снаряжение не изменено.</text></string>
+	<string id="ui_apb_v2_suit_applied"><text>Комплект применён.</text></string>
+	<string id="ui_apb_v2_suit_applied_animation_partial"><text>Комплект применён, но одна из анимаций снаряжения недоступна.</text></string>
+	<string id="ui_apb_v2_suit_applied_partial"><text>Комплект применён частично: недоступно — %d, отклонено — %d.</text></string>
+	<string id="ui_apb_v2_suit_verify_blocked"><text>Применение комплекта завершено, но другая анимация помешала итоговой проверке.</text></string>
+	<string id="ui_apb_v2_suit_exact_missing"><text>Точный сохранённый экземпляр костюма отсутствует в инвентаре.</text></string>
+	<string id="ui_apb_v2_suit_start_blocked"><text>Не удалось начать применение комплекта: другая анимация предмета не завершилась.</text></string>
+	<string id="ui_apb_v2_suit_busy"><text>Смена комплекта уже выполняется.</text></string>
+	<string id="ui_apb_v2_suit_lam2_missing"><text>Для смены комплекта требуется FDDA/LAM2.</text></string>
+	<string id="ui_apb_v2_suit_empty"><text>Этот слот комплекта пуст.</text></string>
+	<string id="ui_apb_v2_suit_already_equipped"><text>Этот комплект уже надет.</text></string>
+</string_table>

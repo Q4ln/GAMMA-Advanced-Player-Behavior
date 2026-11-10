@@ -1,0 +1,14 @@
+<w>
+	<!-- Haru ARM layout (ui_haru_radial_menu.xml); positions are script-corrected. -->
+	<bg x="0" y="0" width="426" height="426" stretch="1">
+		<texture>ui_qaw_wheel_bg</texture>
+	</bg>
+
+	<title x="113" y="188" width="200" height="60" stretch="1">
+		<text complex_mode="1" r="240" g="240" b="240" align="c" vert_align="t" font="letterica25"/>
+	</title>
+
+	<cursor x="0" y="0" width="426" height="213" stretch="1">
+		<texture>ui_qaw_cursor</texture>
+	</cursor>
+</w>
