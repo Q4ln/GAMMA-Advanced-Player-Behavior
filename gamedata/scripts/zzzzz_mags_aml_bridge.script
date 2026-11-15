@@ -314,7 +314,8 @@ local function seam_load_one_round(magazine, capacity)
 end
 local function seam_unload_one_round(magazine)
 	local data = session_mag_data(magazine, true)
-	if not data or #data.loaded == 0 then return true end
+	local keep = session.unload_to or 0
+	if not data or #data.loaded <= keep then return true end
 	local actor = db and db.actor
 	if not (actor and create_ammo) then
 		log_error("unload stopped: actor or create_ammo unavailable") return true
@@ -332,7 +333,7 @@ local function seam_unload_one_round(magazine)
 		return true
 	end
 	inventory_refresh(2)
-	return #after.loaded == 0
+	return #after.loaded <= keep
 end
 local function begin_legacy_session(plan, is_unload, field_owned)
 	if not (host_mode == "legacy" and driver_claim and plan and plan.magazine) then return false end
@@ -344,6 +345,7 @@ local function begin_legacy_session(plan, is_unload, field_owned)
 	session.ammo, session.ammo_section = plan.ammo, plan.ammo_section or section_of(plan.ammo)
 	session.priority = plan.priority or (session.ammo_section and { session.ammo_section }) or {}
 	session.exhausted, session.capacity = plan.exhausted or {}, tonumber(plan.capacity) or 0
+	session.unload_to = is_unload and plan.unload_to or nil
 	session.restore_slot, session.interrupt_requested = nil, false
 	session.field_owned, cancel_latched = field_owned and true or false, false
 	session.locked_ammo = plan.locked_ammo or field_owned and plan.preferred or nil
@@ -595,6 +597,9 @@ local function install_host()
 	return true
 end
 function available() return host_mode ~= "inactive" and bind_assignment() end
+-- A hand-assigned magazine holding other ammo is converted (unloaded, then
+-- refilled) only where this bridge owns the round seams.
+local function converting() return host_mode == "legacy" end
 local function host_active()
 	if host_mode == "legacy" then return session.active and true or false end
 	if host_mode == "native" then
@@ -1102,6 +1107,17 @@ local function advance_batch(first)
 				held.phase = "ready"
 			end
 		end
+		if not reason and held and held.phase == "unloading" then
+			if batch.last_id ~= held.magazine_id then
+				reason, detail = "held-session-lost", "held AML unload ended without the exact magazine id"
+			else
+				local after = loaded_count(held.magazine_id)
+				local progressed = after ~= nil and after < (batch.before_count or after)
+				batch.last_id, batch.current_id, batch.before_count = nil, nil, nil
+				if not progressed then reason, detail = "held-stalled", "held magazine made no unloading progress"
+				else held.phase = "ready" end
+			end
+		end
 		if not reason and held and held.phase == "loading" then
 			if batch.last_id ~= held.magazine_id then
 				reason, detail = "held-session-lost", "held AML session ended without the exact magazine id"
@@ -1127,8 +1143,10 @@ local function advance_batch(first)
 			else
 				local ok
 				ok, plan = pcall(assignment.field_plan, weapon,
-					{ [held.magazine_id] = true }, held.preferred)
+					{ [held.magazine_id] = true }, held.preferred, converting())
 				if not ok then reason, detail, plan = "planner_failed", plan, nil
+				elseif plan and plan.unload_to then
+					held.phase = "unloading"
 				elseif plan then
 					held.phase, held.loaded_started = "loading", true
 				else
@@ -1150,7 +1168,7 @@ local function advance_batch(first)
 			local weapon = group.weapon_id and resolve_batch_weapon() or nil
 			if group.weapon_id and not weapon then reason = "weapon_changed" break end
 			local ok
-			ok, plan = pcall(assignment.field_plan, weapon, group.magazine_ids, group.preferred_ammo)
+			ok, plan = pcall(assignment.field_plan, weapon, group.magazine_ids, group.preferred_ammo, converting())
 			if not ok then reason, detail, plan = "planner_failed", plan, nil break end
 			if plan then break end
 			batch.group_index = batch.group_index + 1
@@ -1172,7 +1190,8 @@ local function advance_batch(first)
 	local id = plan.magazine_id or object_id(plan.magazine)
 	if last_id and id == last_id then
 		local after = loaded_count(last_id)
-		if after == nil or after <= (batch.before_count or after) then
+		local before_count = batch.before_count or after
+		if after == nil or (batch.unloading and after >= before_count or not batch.unloading and after <= before_count) then
 			log_error("field batch made no progress | magazine_id=%s", tostring(last_id))
 			finish_batch(true, "stalled") return "consumed"
 		end
@@ -1182,11 +1201,11 @@ local function advance_batch(first)
 	local before = id and loaded_count(id) or nil
 	if not (batch.active and not batch.cancelled and plan.magazine and id and before) then return "consumed" end
 	batch.last_id, batch.current_id, batch.before_count = nil, id, before
-	batch.running, batch.seen_active = true, false
+	batch.running, batch.seen_active, batch.unloading = true, false, plan.unload_to ~= nil
 	batch.cancel_deadline, batch.query_interrupt_sent, cancel_latched = nil, nil, false
 	log_batch_started()
 	local result = host_mode == "legacy" and
-		(begin_legacy_session(plan, false, true) and "started" or "consumed") or claim_native(plan)
+		(begin_legacy_session(plan, batch.unloading, true) and "started" or "consumed") or claim_native(plan)
 	batch.seen_active = host_in_flight()
 	if result == "consumed" and not batch.seen_active then settle_batch_magazine(id) end
 	return result
@@ -1198,7 +1217,7 @@ function claim_field_load(weapon)
 		local ok, readiness = pcall(core.readiness, weapon, object_id(weapon))
 		if not ok or readiness ~= "healthy" then return readiness == "grenade" and "pass" or "consumed" end
 	end
-	local ok, groups, total, held = pcall(assignment.field_snapshot, weapon)
+	local ok, groups, total, held = pcall(assignment.field_snapshot, weapon, converting())
 	if not ok then log_error("assignment field snapshot failed: %s", tostring(groups)) return "consumed" end
 	total = tonumber(total) or 0
 	local actor = db and db.actor

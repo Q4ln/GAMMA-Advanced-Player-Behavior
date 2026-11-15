@@ -241,6 +241,18 @@ local function current_magazine_rounds(weapon)
 	if count > 0 and safe_bool(magazines and magazines.retain_round, weapon) then count = count - 1 end
 	return math.max(0, count)
 end
+-- Rounds a carried magazine of the loaded ammo needs to replace the inserted
+-- one: as many as it holds, one more once it is full (an unreadable capacity
+-- counts as full), so a full magazine is never swapped for an equal one.
+local function rounds_to_replace(weapon)
+	local count = current_magazine_rounds(weapon)
+	local ok, data = loaded_mag_data(object_id(weapon))
+	local section = ok and data and data.section or nil
+	if not section or section == "no_mag" then return count end
+	local capacity = type(SYS_GetParam) == "function" and tonumber((SYS_GetParam(2, section, "max_mag_size"))) or nil
+	if not capacity or count >= capacity then return count + 1 end
+	return count
+end
 local function retained_chamber_section(weapon)
 	if not (magazines and type(magazines.retain_round) == "function" and type(magazines.get_sec_chambered) == "function") then
 		return false, nil end
@@ -933,7 +945,7 @@ local function execute_reload_choice(expected_id, n, selected)
 		local type_ok, current = call_method(weapon, "get_ammo_type")
 		current = type_ok and tonumber(current) or nil
 		if not (magazine and current) then return false end
-		if n == current + 1 and candidate_count <= current_magazine_rounds(weapon) then return false end
+		if n == current + 1 and candidate_count < rounds_to_replace(weapon) then return false end
 		return start_or_stage_mag_reload(weapon, magazine, selected)
 	end
 	local count_ok, count = call_method(weapon, "get_ammo_in_magazine")
@@ -1028,16 +1040,16 @@ local function open_reload_wheel(weapon)
 	end
 	local type_ok, ammo_type = call_method(weapon, "get_ammo_type")
 	local index = type_ok and (tonumber(ammo_type) or -1) + 1 or nil
-	local current_count = detachable and current_magazine_rounds(weapon) or 0
+	local current_count = detachable and rounds_to_replace(weapon) or 0
 	-- The loaded type stays marked by Mags' highlight either way; it is greyed
-	-- only when a pick could not add a round: a full internal magazine, or no
-	-- carried magazine of that type holding more than the inserted one.
+	-- only for a full internal magazine, or when no carried magazine of that
+	-- type can replace the inserted one (rounds_to_replace).
 	local internal_full = not detachable and internal_magazine_full(weapon)
 	-- A break-action reload (CWeaponBM16::PlayAnimReload) asks for two shells
 	-- of the chosen type and switches to another carried type when there is
 	-- only one, so with the wheel open a one-shell type cannot be honoured.
 	local break_action = not detachable and weapon_class(weapon) == "WP_BM16"
-	local last, action_count, other_types = tonumber(gui.ammo_max) or 12, 0, 0
+	local last, action_count, other_types, single = tonumber(gui.ammo_max) or 12, 0, 0, nil
 	gui.avail = gui.avail or {}
 	for i = 1, last do
 		local section = gui.ammo_list and gui.ammo_list[i] or nil
@@ -1046,7 +1058,7 @@ local function open_reload_wheel(weapon)
 		if detachable and section then magazine, candidate_count = exact_selected_magazine(weapon, section) end
 		local redundant = false
 		if i == index then
-			if detachable then redundant = not candidate_count or candidate_count <= current_count
+			if detachable then redundant = not candidate_count or candidate_count < current_count
 			else redundant = internal_full end
 		end
 		local single_shell = break_action and section and (tonumber(gui.ammo_inv and gui.ammo_inv[section]) or 0) < 2
@@ -1058,7 +1070,7 @@ local function open_reload_wheel(weapon)
 			end
 			if gui.box_num and gui.box_num[i] then call_method(gui.box_num[i], "SetText", "") end
 		else
-			action_count = action_count + 1
+			action_count, single = action_count + 1, i
 			if i ~= index then other_types = other_types + 1 end
 		end
 	end
@@ -1077,13 +1089,16 @@ local function open_reload_wheel(weapon)
 		end
 	end
 	if not extended_used and gui.extended then call_method(gui.extended, "Show", false) end
-	-- With no other type carried, a magazine-less weapon tops up straight away.
-	if action_count == 0 or not detachable and other_types == 0 then
+	-- With no other type carried, a magazine-less weapon tops up straight away;
+	-- a magazine-fed one with a single pickable magazine loads it straight away.
+	if action_count == 0 or not detachable and other_types == 0 or detachable and action_count == 1 then
 		gui:Close()
-		if not detachable then canonical_reload() end
-		log_info("Reload ammo selector skipped | weapon_id=%s | reason=no_options | detachable=%s",
-			tostring(id), tostring(detachable))
-		return true, "no_options"
+		local reason = detachable and action_count == 1 and "single_option" or "no_options"
+		if not detachable then canonical_reload()
+		elseif action_count == 1 then execute_reload_choice(id, single, gui.ammo_list[single]) end
+		log_info("Reload ammo selector skipped | weapon_id=%s | reason=%s | detachable=%s",
+			tostring(id), reason, tostring(detachable))
+		return true, reason
 	end
 	return true, "opened"
 end

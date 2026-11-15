@@ -6,7 +6,8 @@ wheel key, and the mod adds no animations of its own. Every system except Suit
 Setups and the Reload-tap ammunition wheel can be turned off in MCM.
 
 - **Stances:** Crouch and Jump taps and holds move you between standing,
-  crouching and prone.
+  crouching and prone, and the stance stays while you use the inventory, a
+  wheel or an item.
 - **Weapon readiness:** a supported weapon lowers itself in peace and raises
   itself for Aim, Fire and combat.
 - **Visor wiping:** the game's own wipe starts once a supported mask's visor is
@@ -18,9 +19,11 @@ Setups and the Reload-tap ammunition wheel can be turned off in MCM.
 - **Suit Setups:** an eight-slot manager and wheel that swap to the exact
   items you saved, with FDDA Redone's equipment animations. They replace
   G_FLAT's Remember Belt Items.
-- **Reloading with GAMMA Mags Reloaded:** a Reload tap opens an ammunition
-  wheel, and a Reload hold field-loads your loadout magazines with Animated
-  Magazine Loading (optional, not part of GAMMA).
+- **Reloading with GAMMA Mags Reloaded:** a Reload tap loads your fullest
+  magazine straight away, or opens an ammunition wheel when there is a choice,
+  and a Reload hold field-loads your loadout magazines with their assigned
+  ammunition through Animated Magazine Loading (optional, not part of
+  GAMMA).
 
 It requires GAMMA Mags Reloaded 1.05, which is not part of GAMMA, and GAMMA's
 G.A.M.M.A. Unjam Reload on the same key must be disabled.
@@ -35,9 +38,9 @@ G.A.M.M.A. Unjam Reload on the same key must be disabled.
 
 *The Suit Setups manager: each slot shows the saved suit and its name, coloured by status.*
 
-![A Reload tap opens the ammunition wheel. The ammunition already loaded stays marked.](screenshots/reload_ammo_wheel.png)
+![With a choice to make, a Reload tap opens the ammunition wheel. The ammunition already loaded stays marked.](screenshots/reload_ammo_wheel.png)
 
-*A Reload tap opens the ammunition wheel. The ammunition already loaded stays marked.*
+*With a choice to make, a Reload tap opens the ammunition wheel. The ammunition already loaded stays marked.*
 
 ## Download
 

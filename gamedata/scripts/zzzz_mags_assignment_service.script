@@ -661,8 +661,16 @@ function after_load_weapon(weapon, magazine, token, ok)
 	return on_record_transfer("load", token.magazine_id, token.weapon_id, token.snapshot,
 		{ preferred = token.preferred, order = token.order, source_live = token.source_live })
 end
+-- How many of the first `count` rounds stay when a hand-assigned magazine is
+-- converted: everything from its deepest round of another ammo up is unloaded
+-- before the assigned ammo is loaded.
+local function kept_rounds(data, preferred, count, convert)
+	if not (convert and embedded(data) == preferred) then return count end
+	for i = 1, count do if data.loaded[i] ~= preferred then return i - 1 end end
+	return count
+end
 -- `exhausted` remains mutable so AML can advance through stacks of the exact assignment.
-local function field_candidates(weapon, allowed_ids, preferred_first)
+local function field_candidates(weapon, allowed_ids, preferred_first, convert)
 	local actor = db and db.actor
 	if not (actor and magazine_binder and type(magazine_binder.is_magazine) == "function") then return {} end
 	if weapon and type(magazine_binder.is_compatible) ~= "function" then return {} end
@@ -683,7 +691,8 @@ local function field_candidates(weapon, allowed_ids, preferred_first)
 			if not (priority and type(data.loaded) == "table") then return end
 			local section = section_of(magazine) or data.section
 			local capacity = tonumber(SYS_GetParam and SYS_GetParam(2, section, "max_mag_size")) or 30
-			local missing = capacity - #data.loaded
+			local kept = kept_rounds(data, preferred, #data.loaded, convert)
+			local missing = capacity - kept
 			if missing <= 0 then return end
 			local exhausted = {}
 			local ammo, ammo_section = choose_ammo(priority, exhausted)
@@ -691,6 +700,7 @@ local function field_candidates(weapon, allowed_ids, preferred_first)
 			candidates[#candidates + 1] = { magazine = magazine, magazine_id = id,
 				preferred = preferred, priority = priority, ammo = ammo,
 				ammo_section = ammo_section, exhausted = exhausted, capacity = capacity, missing = missing,
+				unload_to = kept < #data.loaded and kept or nil,
 				delay = magazines and type(magazines.get_mag_time) == "function" and
 					magazines.get_mag_time(section, false) or 0.4 }
 		end)
@@ -705,11 +715,11 @@ local function field_candidates(weapon, allowed_ids, preferred_first)
 	end)
 	return candidates
 end
-function field_plan(weapon, allowed_ids, preferred_first)
+function field_plan(weapon, allowed_ids, preferred_first, convert)
 	ensure_layout()
-	return field_candidates(weapon, allowed_ids, preferred_first)[1]
+	return field_candidates(weapon, allowed_ids, preferred_first, convert)[1]
 end
-local function held_field_candidate(weapon)
+local function held_field_candidate(weapon, convert)
 	local weapon_id = object_id(weapon)
 	local slot = weapon_id and loaded_slot(weapon_id) or nil
 	if not (weapon_id and type(slot) == "number") then return nil end
@@ -734,17 +744,17 @@ local function held_field_candidate(weapon)
 			physical = physical - 1
 		end
 	end
-	if physical >= capacity then return nil end
+	if kept_rounds(data, preferred, physical, convert) >= capacity then return nil end
 	local exhausted = {}
 	local ammo = choose_ammo(priority, exhausted)
 	if not ammo then return nil end
 	return { weapon_id = weapon_id, weapon_slot = slot, magazine_section = data.section, preferred = preferred }
 end
-function field_snapshot(active_weapon)
+function field_snapshot(active_weapon, convert)
 	ensure_layout()
 	local actor = db and db.actor
 	if not actor then return {}, 0, nil end
-	local held = active_weapon and held_field_candidate(active_weapon) or nil
+	local held = active_weapon and held_field_candidate(active_weapon, convert) or nil
 	local ordered, seen_weapons = {}, {}
 	local function add_weapon(weapon, slot)
 		local id = object_id(weapon)
@@ -769,7 +779,7 @@ function field_snapshot(active_weapon)
 	local groups, seen_mags, total = {}, {}, 0
 	for i = 1, #ordered do
 		local entry = ordered[i]
-		local candidates = field_candidates(entry.weapon, nil, entry.preferred_ammo)
+		local candidates = field_candidates(entry.weapon, nil, entry.preferred_ammo, convert)
 		local ids, count = {}, 0
 		for n = 1, #candidates do
 			local id = candidates[n].magazine_id
@@ -782,7 +792,7 @@ function field_snapshot(active_weapon)
 	end
 	-- Equipped pouch magazines remain field-loadable even when no compatible
 	-- weapon is currently slotted.  They are still filtered by is_live().
-	local remaining, ids = field_candidates(nil, nil, nil), {}
+	local remaining, ids = field_candidates(nil, nil, nil, convert), {}
 	local count = 0
 	for i = 1, #remaining do
 		local id = remaining[i].magazine_id

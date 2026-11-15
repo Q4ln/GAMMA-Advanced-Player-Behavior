@@ -1,6 +1,6 @@
 # Advanced Player Behavior
 
-Version `d2026.11.10.4`
+Version `d2026.11.15.1`
 
 Advanced Player Behavior (APB) is a set of player-control systems for GAMMA:
 tactical stances on the Crouch and Jump keys, a weapon that lowers itself in
@@ -28,7 +28,8 @@ off switch and stay active while APB is installed.
 animation. The tap/hold boundary is 250 ms by default. A stance change that is
 blocked (for example standing up under a low ceiling) is cancelled, not
 queued, and Walk cannot change your stance by accident while you are crouched
-or prone.
+or prone. You stay crouched or prone while the inventory, a wheel or the PDA is
+open, while you use an item, check or unjam your weapon, or quick-melee.
 
 While stance controls are on, APB holds the game's `g_crouch_toggle` and
 `g_walk_toggle` options off, because the stance logic needs hold behaviour. It
@@ -115,23 +116,29 @@ priority over it.
 
 ### Reloading with GAMMA Mags Reloaded
 
-- **Tap Reload** opens the ammunition wheel. A single real alternative is
-  shown, not chosen for you. The ammunition you already have loaded stays
-  marked, and you can pick it to top up while the weapon is not full. It is
-  greyed out only when picking it would add nothing: a full tube or internal
-  magazine, or, on a magazine weapon, no carried magazine of that type with
-  more rounds than the one inserted. On break-action shotguns (BM-16, TOZ-34)
-  a type is greyed while you carry only one shell of it, because the game's
-  reload takes two and would load another type instead. On a weapon without a
-  detachable magazine, if you carry no other ammunition it accepts, the tap
-  reloads straight away.
-- Magazine weapons reload the exact magazine you picked; GAMMA Mags Reloaded
-  and Dynamic Reload Speeds still own the swap itself and its timing. Internal,
-  tube-fed, bolt-action and magazine-less weapons use their normal reloads.
+- **Tap Reload** opens the ammunition wheel when there is a choice to make.
+  The ammunition you already have loaded stays marked, and you can pick it to
+  top up while the weapon is not full. It is greyed out when picking it would
+  add nothing: a full tube or internal magazine, or, on a magazine weapon, no
+  carried magazine of that type with at least as many rounds as the one
+  inserted, or more rounds once that one is full. On break-action shotguns (BM-16, TOZ-34) a type is greyed while
+  you carry only one shell of it, because the game's reload takes two and
+  would load another type instead. On a weapon without a detachable magazine,
+  if you carry no other ammunition it accepts, the tap reloads straight away;
+  a single other type is shown, not chosen for you. On a magazine weapon with
+  only one magazine you could pick, the tap loads it straight away.
+- Magazine weapons load the fullest carried magazine of the ammunition picked;
+  GAMMA Mags Reloaded and Dynamic Reload Speeds still own the swap itself and
+  its timing. Internal, tube-fed, bolt-action and magazine-less weapons use
+  their normal reloads.
 - **Hold Reload** (with Animated Magazine Loading installed) runs a field-loading
   batch over the magazines in your loadout, even with empty hands. Each loadout
   magazine can be assigned an ammunition type from its right-click menu; field
-  loading never substitutes another type.
+  loading never substitutes another type. A magazine assigned an ammunition
+  type that holds rounds of another type is unloaded first, down to its last
+  round of the other type, and then filled with its own type; this happens
+  only while you carry that type. A magazine counts as assigned once you pick
+  its type, or once it has been in a weapon.
 - Weapon Parts Overhaul jams still clear on a Reload tap.
 - The game's own automatic reload (`g_auto_reload`) is switched off and kept
   off while the reload system is active, because it would bypass the
@@ -201,9 +208,9 @@ folder) contains these lines (the magazine line has more fields after
 `build=`):
 
 ```
-[ADVANCED-PLAYER-BEHAVIOR] installed | build=d2026.11.10.4 | router=deadline/event | input=single-composable | systems=contextual-L,stance,readiness,freezoom,visor,suit-setups | inactive=none | mags=vendored
-[ADVANCED-PLAYER-BEHAVIOR:SUIT-SETUPS] installed | build=d2026.11.10.4 | schema=1 | slots=8 | scheduler=shared
-[ADVANCED-PLAYER-BEHAVIOR:MAGS-COMPAT] installed | build=d2026.11.10.4 | ...
+[ADVANCED-PLAYER-BEHAVIOR] installed | build=d2026.11.15.1 | router=deadline/event | input=single-composable | systems=contextual-L,stance,readiness,freezoom,visor,suit-setups | inactive=none | mags=vendored
+[ADVANCED-PLAYER-BEHAVIOR:SUIT-SETUPS] installed | build=d2026.11.15.1 | schema=1 | slots=8 | scheduler=shared
+[ADVANCED-PLAYER-BEHAVIOR:MAGS-COMPAT] installed | build=d2026.11.15.1 | ...
 ```
 
 If one system fails to start, APB logs why, lists it after `inactive=`, and
@@ -383,7 +390,21 @@ section in `axr_options.ltx`; APB's data in your saves.
 - A key rebound in the game's own controls menu, rather than through MCM, is
   picked up by APB at the next save load, level change, death or MCM change.
 - The Russian text has not been checked in game.
-- This build adds the guard for Animated Magazine Loading Update 10 and has
+- A loot, trade or dialogue window, the Suit Setups wheel and manager, and an
+  animation that blocks all input (some outfit, skinning or body-search
+  animations) still stand you up: the game passes no key to the character
+  there. You crouch or go prone again as soon as they end.
+- This build changes the Reload tap, field loading and stances. It had two
+  short scripted runs in game on a save that already used APB, with real key
+  presses, and no errors from APB in the log. Reload taps on an AK-74 loaded
+  a sole magazine and a sole magazine of another ammunition straight away,
+  swapped a part-empty magazine for an equal and for a fuller one, left a
+  full one alone next to an equal spare, and opened the wheel for two
+  choices; Reload closed it. Crouch and prone stayed with the inventory and
+  the wheel open and during an item animation. A Reload hold emptied a
+  magazine of other ammunition and refilled it with its assigned type. Not
+  tried: a loot window, quick melee, the Suit Setups menus, or a full play
+  session. The build before it adds the guard for Animated Magazine Loading Update 10 and has
   had one short scripted run in game with Update 10 installed, on a save that
   already used APB, with no errors from APB in the log. A test script started
   one inventory drag-load, and a real Reload hold field-loaded two loadout
@@ -422,6 +443,18 @@ section in `axr_options.ltx`; APB's data in your saves.
   fire first. GAMMA does the same without APB.
 
 ## Changelog
+
+### d2026.11.15.1
+
+- Stances: crouch and prone no longer drop while a window that lets you move
+  is open, or while you use an item, check or unjam your weapon, or
+  quick-melee.
+- Reload tap on a magazine weapon: no wheel when there is only one magazine
+  to pick; it loads straight away. The loaded ammunition also takes a
+  magazine with as many rounds as a part-empty inserted one, not only more; a
+  full one is never swapped for an equal one.
+- Reload hold: a magazine holding rounds of another type than its assigned
+  one is unloaded and refilled with its own type, instead of topped up.
 
 ### d2026.11.10.4
 

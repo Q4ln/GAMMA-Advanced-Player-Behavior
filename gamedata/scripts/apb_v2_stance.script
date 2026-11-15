@@ -176,12 +176,18 @@ local function cancel_gesture(reason)
 end
 
 
+-- Only climbing and destructive contexts let the stance go.  Any other block
+-- (a window, an item or weapon animation, quick melee) keeps the committed
+-- stance held: with the toggles off the engine stands the actor up on the
+-- first update without a hold.  A window that stops movement still eats the
+-- hold, and the restore below lowers the actor again.
 local function enter_suspension(reason, destructive)
-	if not suspended then suspended = { saved = committed, adopt = false } end
+	if not suspended then suspended = { saved = committed, adopt = false, hold = false } end
 	if destructive then suspended.adopt = true end
+	suspended.hold = not suspended.adopt and reason ~= "climb"
 	cancel_gesture("context-" .. tostring(reason))
 	pending_raise = nil
-	requested = player.realized_stance()
+	requested = suspended.hold and suspended.saved or player.realized_stance()
 end
 
 
@@ -507,7 +513,11 @@ function on_update(current)
 		local down, known = api.hardware_down(dik)
 		if known and not down then accel_claims[dik] = nil end
 	end
-	if update_suspension() then return 50 end
+	if update_suspension() then
+		if not (suspended.hold and requested > 0) then return 50 end
+		drive()
+		return 0
+	end
 	if adopt_next then
 		adopt_next = false
 		committed = player.realized_stance()

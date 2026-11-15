@@ -16,7 +16,7 @@
 -- exports one MODULE descriptor whose handlers are function values, so the
 -- core never probes a namespace by name.
 
-BUILD = "d2026.11.10.4"
+BUILD = "d2026.11.15.1"
 ROOT = "advanced_player_behavior"
 SAVE_ROOT = "advanced_player_behavior_v2"
 SAVE_SCHEMA = 1
